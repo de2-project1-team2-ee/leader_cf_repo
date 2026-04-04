@@ -12,6 +12,12 @@ Parameters:
     Description: 'Select an existing EC2 KeyPair for SSH access'
 
   # --- IP 대역 파라미터 ---
+  ## 대역 설정시, 중복 방지를 위해서. 마스킹 된 앞에서부터 20비트대부터 주소를 할당해야 합니다.
+  ## 예를 들어 10.0.0.0/20을 바탕으로 한 default 대역을 할당하셨다면,
+  ## 다음 대역은 10.0.0001 0000~1111 1111.* /20 으로 대역을 할당할 수 있습니다.
+  ### 추가로 현재 테스트 중인, 공유 계정에서는 region별 최대 nat를 2개까지만 할당 가능하니, 이점 확인하시어
+  ### 기존에 같은 CF로 할당된 vpc가 2개가 이미 있다면, 3번째 생성부터는 fail이 발생할 수 있습니다.
+  ### 확인해서 작업해주세요.
   VpcCidrBlock: { Type: String, Default: '10.0.0.0/20' }
   PublicSubnet1Cidr: { Type: String, Default: '10.0.0.0/24' }
   PublicSubnet2Cidr: { Type: String, Default: '10.0.1.0/24' }
@@ -171,12 +177,25 @@ Resources:
   # ==========================================
   # 4. Security Groups
   # ==========================================
+  # 이하, BastionSG는 ssh 터미널 사용에 따른 임시코드 입니다.
+  # 추후, 구축 완료시. 해당 코드를 삭제하고 아래 BastionSG 코드를 활성화 하세요.
   BastionSG:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow SSH
       VpcId: !Ref MainVPC
       SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }]
+# 아래는 공인 IP 할당을 통한 SSH 제한 설정
+#      SecurityGroupIngress:
+#        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: "내.공인.IP.주소/32" }
+
+  # 추후 활성화 해야하는
+#  BastionSG:
+#    Type: AWS::EC2::SecurityGroup
+#    Properties:
+#      GroupDescription: Allow strictly no inbound ports (SSM Only Access)
+#      VpcId: !Ref MainVPC
+#      # SecurityGroupIngress: 아무것도 설정하지 않음 (전면 차단)
 
   PublicAppSG:
     Type: AWS::EC2::SecurityGroup
@@ -209,10 +228,14 @@ Resources:
   BastionRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "${ServiceName}-bastion-role" # 역할 이름 명시적 지정
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
-        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
-      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/AdministratorAccess" ]
+        Statement: [ { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole } ]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" # SSH 키 없이 웹 터미널 접속(SSM) 권한 추가
+
   BastionProfile:
     Type: AWS::IAM::InstanceProfile
     Properties: { Roles: [ !Ref BastionRole ] }
@@ -233,7 +256,7 @@ Resources:
           dnf update -y && dnf install -y unzip wget tar
           curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
           unzip awscliv2.zip && ./aws/install
-          curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.29.0/2024-01-04/bin/linux/amd64/kubectl
+          curl -O https://s3.${AWS::Region}.amazonaws.com/amazon-eks/1.29.0/2024-01-04/bin/linux/amd64/kubectl
           chmod +x ./kubectl && mv ./kubectl /usr/local/bin/kubectl
           curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
           mv /tmp/eksctl /usr/local/bin
@@ -264,37 +287,37 @@ Resources:
   # ==========================================
   # 7. Private DB EC2 Instances (EBS 명시적 추가 할당)
   # ==========================================
-  PrivateDB1:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t3.medium
-      ImageId: !Ref LatestAmiId
-      KeyName: !Ref KeyName
-      SubnetId: !Ref PrivateDBSubnet1
-      SecurityGroupIds: [!Ref DBSG]
-      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-1" }]
-      BlockDeviceMappings:
-        - DeviceName: /dev/sdf
-          Ebs:
-            VolumeSize: 50
-            VolumeType: gp3
-            DeleteOnTermination: false
-
-  PrivateDB2:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t3.medium
-      ImageId: !Ref LatestAmiId
-      KeyName: !Ref KeyName
-      SubnetId: !Ref PrivateDBSubnet2
-      SecurityGroupIds: [!Ref DBSG]
-      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-2" }]
-      BlockDeviceMappings:
-        - DeviceName: /dev/sdf
-          Ebs:
-            VolumeSize: 50
-            VolumeType: gp3
-            DeleteOnTermination: false
+#  PrivateDB1:
+#    Type: AWS::EC2::Instance
+#    Properties:
+#      InstanceType: t3.medium
+#      ImageId: !Ref LatestAmiId
+#      KeyName: !Ref KeyName
+#      SubnetId: !Ref PrivateDBSubnet1
+#      SecurityGroupIds: [!Ref DBSG]
+#      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-1" }]
+#      BlockDeviceMappings:
+#        - DeviceName: /dev/sdf
+#          Ebs:
+#            VolumeSize: 50
+#            VolumeType: gp3
+#            DeleteOnTermination: false
+#
+#  PrivateDB2:
+#    Type: AWS::EC2::Instance
+#    Properties:
+#      InstanceType: t3.medium
+#      ImageId: !Ref LatestAmiId
+#      KeyName: !Ref KeyName
+#      SubnetId: !Ref PrivateDBSubnet2
+#      SecurityGroupIds: [!Ref DBSG]
+#      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-2" }]
+#      BlockDeviceMappings:
+#        - DeviceName: /dev/sdf
+#          Ebs:
+#            VolumeSize: 50
+#            VolumeType: gp3
+#            DeleteOnTermination: false
 
   # ==========================================
   # 8. EKS Cluster & App NodeGroup
@@ -302,22 +325,35 @@ Resources:
   EksClusterRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "${ServiceName}-eks-cluster-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
-        Statement: [{ Effect: Allow, Principal: { Service: eks.amazonaws.com }, Action: sts:AssumeRole }]
+        Statement: [ { Effect: Allow, Principal: { Service: eks.amazonaws.com }, Action: sts:AssumeRole } ]
       ManagedPolicyArns: [ "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy" ]
 
   EksNodeRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "${ServiceName}-eks-node-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
-        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+        Statement: [ { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole } ]
       ManagedPolicyArns:
         - "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
         - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
         - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" # 노드 트러블슈팅용 SSM 접근 권한
+      # 커스텀 권한(Inline Policy) 직접 명시 영역
+      Policies:
+        - PolicyName: !Sub "${ServiceName}-node-custom-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource: "*" # 필요 시 특정 S3 버킷이나, ALB Controller 권한 등으로 교체/확장 가능
   EksCluster:
     Type: AWS::EKS::Cluster
     Properties:
@@ -338,3 +374,23 @@ Resources:
       Subnets: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
       InstanceTypes: [ "t3.medium" ]
       ScalingConfig: { MinSize: 2, DesiredSize: 2, MaxSize: 4 }
+
+# ==========================================
+# 9. Outputs (생성된 IAM 정보 등 결과값 출력)
+# ==========================================
+Outputs:
+  BastionRoleArn:
+    Description: "IAM Role ARN for Bastion Server"
+    Value: !GetAtt BastionRole.Arn
+    Export:
+      Name: !Sub "${ServiceName}-BastionRoleArn"
+
+  EksNodeRoleArn:
+    Description: "IAM Role ARN for EKS App Nodes"
+    Value: !GetAtt EksNodeRole.Arn
+    Export:
+      Name: !Sub "${ServiceName}-EksNodeRoleArn"
+
+  EksClusterRoleArn:
+    Description: "IAM Role ARN for EKS Cluster Control Plane"
+    Value: !GetAtt EksClusterRole.Arn
