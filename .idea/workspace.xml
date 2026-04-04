@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="5460748c-ee89-42c5-ab78-6fd510036fd6" name="Changes" comment="초기 CF 파일 업로드 (EBS 설정부 미제거, region 변수변환 작업 진행안됨, IP 대역 할당에 따른 추가 VPC 적용 여부확인 필요)">
+      <change beforePath="$PROJECT_DIR$/2e-server-cloudformation-0.1.0.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/2e-server-cloudformation-0.1.0.yaml" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="MarkdownSettingsMigration">
+    <option name="stateVersion" value="1" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 7
+}</component>
+  <component name="ProjectId" id="3BsncsCgVrxZEvQT2uOIscX9ZU9" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "RunOnceActivity.OpenProjectViewOnStart": "true",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "WebServerToolWindowFactoryState": "false",
+    "git-widget-placeholder": "main",
+    "node.js.detected.package.eslint": "true",
+    "node.js.selected.package.eslint": "(autodetect)",
+    "node.js.selected.package.tslint": "(autodetect)",
+    "nodejs_package_manager_path": "npm",
+    "vue.rearranger.settings.migration": "true"
+  }
+}]]></component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="5460748c-ee89-42c5-ab78-6fd510036fd6" name="Changes" comment="초기 CF 파일 업로드 (EBS 설정부 미제거, region 변수변환 작업 진행안됨, IP 대역 할당에 따른 추가 VPC 적용 여부확인 필요)" />
+      <created>1775304857800</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1775304857800</updated>
+      <workItem from="1775304859093" duration="9409000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="초기 CF 파일 업로드 (EBS 설정부 미제거, region 변수변환 작업 진행안됨, IP 대역 할당에 따른 추가 VPC 적용 여부확인 필요)" />
+    <option name="LAST_COMMIT_MESSAGE" value="초기 CF 파일 업로드 (EBS 설정부 미제거, region 변수변환 작업 진행안됨, IP 대역 할당에 따른 추가 VPC 적용 여부확인 필요)" />
+  </component>
+</project>

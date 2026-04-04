@@ -29,7 +29,7 @@ Parameters:
   LatestAmiId:
     Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
     Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
-  
+
   KubernetesVersion:
     Type: String
     Default: '1.29'
@@ -49,7 +49,7 @@ Resources:
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties: { Tags: [{ Key: Name, Value: !Sub "${ServiceName}-igw" }] }
-      
+
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties: { VpcId: !Ref MainVPC, InternetGatewayId: !Ref InternetGateway }
@@ -64,7 +64,7 @@ Resources:
       CidrBlock: !Ref PublicSubnet1Cidr
       AvailabilityZone: !Select [ 0, !GetAZs '' ]
       MapPublicIpOnLaunch: true
-      Tags: 
+      Tags:
         - { Key: Name, Value: !Sub "${ServiceName}-public-1" }
         - { Key: "kubernetes.io/role/elb", Value: "1" }
 
@@ -75,7 +75,7 @@ Resources:
       CidrBlock: !Ref PublicSubnet2Cidr
       AvailabilityZone: !Select [ 1, !GetAZs '' ]
       MapPublicIpOnLaunch: true
-      Tags: 
+      Tags:
         - { Key: Name, Value: !Sub "${ServiceName}-public-2" }
         - { Key: "kubernetes.io/role/elb", Value: "1" }
 
@@ -85,7 +85,7 @@ Resources:
       VpcId: !Ref MainVPC
       CidrBlock: !Ref PrivateAppSubnet1Cidr
       AvailabilityZone: !Select [ 0, !GetAZs '' ]
-      Tags: 
+      Tags:
         - { Key: Name, Value: !Sub "${ServiceName}-private-app-1" }
         - { Key: "kubernetes.io/role/internal-elb", Value: "1" }
         - { Key: "karpenter.sh/discovery", Value: !Sub "${ServiceName}-cluster" }
@@ -96,7 +96,7 @@ Resources:
       VpcId: !Ref MainVPC
       CidrBlock: !Ref PrivateAppSubnet2Cidr
       AvailabilityZone: !Select [ 1, !GetAZs '' ]
-      Tags: 
+      Tags:
         - { Key: Name, Value: !Sub "${ServiceName}-private-app-2" }
         - { Key: "kubernetes.io/role/internal-elb", Value: "1" }
         - { Key: "karpenter.sh/discovery", Value: !Sub "${ServiceName}-cluster" }
@@ -122,11 +122,11 @@ Resources:
   # ==========================================
   NatEIP1: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
   NatEIP2: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
-  
-  NatGW1: 
+
+  NatGW1:
     Type: AWS::EC2::NatGateway
     Properties: { AllocationId: !GetAtt NatEIP1.AllocationId, SubnetId: !Ref PublicSubnet1, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-nat-1" }] }
-  NatGW2: 
+  NatGW2:
     Type: AWS::EC2::NatGateway
     Properties: { AllocationId: !GetAtt NatEIP2.AllocationId, SubnetId: !Ref PublicSubnet2, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-nat-2" }] }
 
@@ -136,7 +136,7 @@ Resources:
   PublicRoute:
     Type: AWS::EC2::Route
     Properties: { RouteTableId: !Ref PublicRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
-  
+
   PrivateAppRT1:
     Type: AWS::EC2::RouteTable
     Properties: { VpcId: !Ref MainVPC, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-app-rt-1" }] }
@@ -156,24 +156,24 @@ Resources:
   RTAssocPub2: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRT } }
   RTAssocPrivApp1: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PrivateAppSubnet1, RouteTableId: !Ref PrivateAppRT1 } }
   RTAssocPrivApp2: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PrivateAppSubnet2, RouteTableId: !Ref PrivateAppRT2 } }
-  
+
   # [문법 교정 부분] DB Subnets are completely isolated (No Internet/NAT route)
   # DB 전용 격리 라우팅 테이블 명시적 생성 및 연결
   PrivateDBRT:
     Type: AWS::EC2::RouteTable
-    Properties: 
+    Properties:
       VpcId: !Ref MainVPC
       Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-rt" }]
 
-  RTAssocPrivDB1: 
+  RTAssocPrivDB1:
     Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: 
+    Properties:
       SubnetId: !Ref PrivateDBSubnet1
       RouteTableId: !Ref PrivateDBRT
-      
-  RTAssocPrivDB2: 
+
+  RTAssocPrivDB2:
     Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties: 
+    Properties:
       SubnetId: !Ref PrivateDBSubnet2
       RouteTableId: !Ref PrivateDBRT
   # ==========================================
@@ -187,31 +187,31 @@ Resources:
       GroupDescription: Allow SSH
       VpcId: !Ref MainVPC
       SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }]
-# 아래는 공인 IP 할당을 통한 SSH 제한 설정
-#      SecurityGroupIngress:
-#        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: "내.공인.IP.주소/32" }
+  # 아래는 공인 IP 할당을 통한 SSH 제한 설정
+  #      SecurityGroupIngress:
+  #        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: "내.공인.IP.주소/32" }
 
   # 추후 활성화 해야하는
-#  BastionSG:
-#    Type: AWS::EC2::SecurityGroup
-#    Properties:
-#      GroupDescription: Allow strictly no inbound ports (SSM Only Access)
-#      VpcId: !Ref MainVPC
-#      # SecurityGroupIngress: 아무것도 설정하지 않음 (전면 차단)
+  #  BastionSG:
+  #    Type: AWS::EC2::SecurityGroup
+  #    Properties:
+  #      GroupDescription: Allow strictly no inbound ports (SSM Only Access)
+  #      VpcId: !Ref MainVPC
+  #      # SecurityGroupIngress: 아무것도 설정하지 않음 (전면 차단)
 
   ## public Subnet, 보안 그룹 설정
   # 해당 영역, Karpenter를 이용한 Ingress 설정 및 LoadBalancer 설정
   ## 검색어 --> 9. AWS Load Balancer Controller 설치 (Ingress 지원용)
   # 으로, 모두 주석 처리.
 
-#  PublicAppSG:
-#    Type: AWS::EC2::SecurityGroup
-#    Properties:
-#      GroupDescription: Public App SG
-#      VpcId: !Ref MainVPC
-#      SecurityGroupIngress:
-#        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
-#        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !GetAtt BastionSG.GroupId }
+  #  PublicAppSG:
+  #    Type: AWS::EC2::SecurityGroup
+  #    Properties:
+  #      GroupDescription: Public App SG
+  #      VpcId: !Ref MainVPC
+  #      SecurityGroupIngress:
+  #        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  #        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !GetAtt BastionSG.GroupId }
 
   ## Eks Node Group(현재 설정상 Private App 영역, 보안그룹 설정)
   EksNodeSG:
@@ -251,10 +251,30 @@ Resources:
     Type: AWS::IAM::InstanceProfile
     Properties: { Roles: [ !Ref BastionRole ] }
 
+  # EKS Access Entry 추가 (Bastion에게 클러스터 관리 권한 자동 부여)
+  BastionAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt BastionRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+      ###      주요 Access Policy들은 다음과 같습니다. 필요에 따라 권한을 조정하실 때 참고하세요.
+      #      ClusterAdmin: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy (모든 권한)
+      #      Admin: arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy (대부분의 관리 권한)
+      #      Edit: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy (수정 권한)
+      #      View: arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy (읽기 권한)
+        # 'iam'이 아니라 'eks'이며, 'cluster-access-policy' 경로를 사용해야 합니다.
+        # - PolicyArn: arn:aws:iam::aws:policy/AmazonEKSClusterAdminPolicy
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
   BastionServer:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t3.nano
+      InstanceType: t3.small
+      # t3.nano 로 했다가, eksctl 안되는 문제 생김;
       ImageId: !Ref LatestAmiId
       KeyName: !Ref KeyName
       SubnetId: !Ref PublicSubnet1
@@ -263,76 +283,129 @@ Resources:
       Tags: [{ Key: Name, Value: !Sub "${ServiceName}-bastion" }]
       UserData:
         Fn::Base64: !Sub |
-        ## 1. Bastion 서버 내부, 명령어 수행을 위한 준비
           #!/bin/bash
-          dnf update -y && dnf install -y unzip wget tar
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip awscliv2.zip && ./aws/install
-        ## 2. kubesctl 설치
-          curl -O https://s3.${AWS::Region}.amazonaws.com/amazon-eks/1.29.0/2024-01-04/bin/linux/amd64/kubectl
-          chmod +x ./kubectl && mv ./kubectl /usr/local/bin/kubectl
-          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
-          mv /tmp/eksctl /usr/local/bin
+          ## 1. Bastion 서버 내부, 명령어 수행을 위한 준비
+                      set -ex # 에러 발생 시 즉시 중단 및 로그 출력
+                      exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
 
-        ## 3. helm 설치
-          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-        ## 4. EKS 접속 및 대기 (클러스터가 생성될 때까지 대기)
-          CLUSTER_NAME="${ServiceName}-cluster"
-          REGION="${AWS::Region}"
-          aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME
+                      echo "Step 1: Basic Tools"
+                      dnf update -y && dnf install -y unzip wget tar
           
-        ## 5. OIDC Provider 연결 (IRSA의 핵심)
-          eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME --approve
+                      echo "Step 2: Install CLI Tools"
+                      curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                      unzip awscliv2.zip && ./aws/install
           
-        ## 6. Karpenter 컨트롤러용 IAM Role 생성 및 IRSA 연결 (자동화)
-          eksctl create iamserviceaccount \
-          --cluster $CLUSTER_NAME \
-          --name karpenter \
-          --namespace karpenter \
-          --role-name "${ServiceName}-karpenter-controller-role" \
-          --attach-policy-arn "arn:aws:iam::aws:policy/AdministratorAccess" \
-          --approve --override-existing-serviceaccounts
-  
-        ## 7. Namespace 생성
-          for ns in dev stg prod monitoring karpenter; do
-          kubectl create namespace $ns --dry-run=client -o yaml | kubectl apply -f -
-          done
                       
-        # 8. Karpenter 설치 (Helm)
-          helm registry checkout oci://public.ecr.aws/karpenter/karpenter --version v0.35.0
-          helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
-          --namespace karpenter \
-          --set serviceAccount.create=false \
-          --set serviceAccount.name=karpenter \
-          --set settings.aws.clusterName=$CLUSTER_NAME \
-          --set settings.aws.defaultInstanceProfile="${ServiceName}-karpenter-node-profile" \
-          --wait
+          ## 2. kubesctl 설치
+                      curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+                      chmod +x kubectl
+                      mv kubectl /usr/local/bin/
+          ## 3. eksctl 설치
+                      # eksctl (보다 견고한 설치 방식)
+                      curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
+                      mv /tmp/eksctl /usr/local/bin/
           
-        # 9. AWS Load Balancer Controller 설치 (Ingress 지원용)
-        # IRSA용 IAM Role 생성 (eksctl 활용)
-          eksctl create iamserviceaccount \
-          --cluster $CLUSTER_NAME \
-          --namespace kube-system \
-          --name aws-load-balancer-controller \
-          --role-name "${ServiceName}-alb-controller-role" \
-          --attach-policy-arn "arn:aws:iam::aws:policy/AmazonEKS_FullAccess" \
-          --approve --override-existing-serviceaccounts
+          ## 4. helm 설치
+                      curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           
-        # Helm 설치
-          helm repo add eks https://aws.github.io/eks-charts
-          helm repo update
-          helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
-          -n kube-system \
-          --set clusterName=$CLUSTER_NAME \
-          --set serviceAccount.create=false \
-          --set serviceAccount.name=aws-load-balancer-controller \
-          --wait  
+          ## 4. EKS 접속 및 대기 (클러스터가 생성될 때까지 대기)
+                      echo "Step 3: Wait for EKS Cluster to be ACTIVE"
+                      CLUSTER_NAME="${ServiceName}-cluster"
+                      REGION="${AWS::Region}"
+          
+          # 클러스터가 ACTIVE 상태가 될 때까지 최대 15분 대기 루프
+                      for i in {1..30}; do
+                        STATUS=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION --query 'cluster.status' --output text 2>/dev/null || echo "WAITING")
+                        if [ "$STATUS" == "ACTIVE" ]; then
+                          echo "Cluster is ACTIVE."
+                          break
+                        fi
+                        echo "Waiting for cluster... ($i/30)"
+                        sleep 30
+                      done
+          
+                      echo "Step 4: Configure Kubeconfig"
+                      aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME
+          
+          ## 5. OIDC Provider 연결 (IRSA의 핵심)
+                      eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME --approve
+          
+          ## 6. Karpenter 컨트롤러용 IAM Role 생성 및 IRSA 연결 (자동화)
+                      eksctl create iamserviceaccount \
+                      --cluster $CLUSTER_NAME \
+                      --name karpenter \
+                      --namespace karpenter \
+                      --role-name "${ServiceName}-karpenter-controller-role" \
+                      --attach-policy-arn "arn:aws:iam::aws:policy/AdministratorAccess" \
+                      --approve --override-existing-serviceaccounts
+          
+          ## 7. Namespace 생성
+                      for ns in dev stg prod monitoring karpenter; do
+                      kubectl create namespace $ns --dry-run=client -o yaml | kubectl apply -f -
+                      done
+          
+          # 8. Karpenter 설치 (Helm)
+                      helm registry checkout oci://public.ecr.aws/karpenter/karpenter --version v0.35.0
+                      helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+                      --namespace karpenter \
+                      --set serviceAccount.create=false \
+                      --set serviceAccount.name=karpenter \
+                      --set settings.aws.clusterName=$CLUSTER_NAME \
+                      --set settings.aws.defaultInstanceProfile="${ServiceName}-karpenter-node-profile" \
+                      --wait
+          
+          # 9. AWS Load Balancer Controller 설치 (Ingress 지원용)
+          # IRSA용 IAM Role 생성 (eksctl 활용)
+                      eksctl create iamserviceaccount \
+                      --cluster $CLUSTER_NAME \
+                      --namespace kube-system \
+                      --name aws-load-balancer-controller \
+                      --role-name "${ServiceName}-alb-controller-role" \
+                      --attach-policy-arn "arn:aws:iam::aws:policy/AmazonEKS_FullAccess" \
+                      --approve --override-existing-serviceaccounts
+          
+          # Helm 설치
+                      helm repo add eks https://aws.github.io/eks-charts
+                      helm repo update
+                      helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+                      -n kube-system \
+                      --set clusterName=$CLUSTER_NAME \
+                      --set serviceAccount.create=false \
+                      --set serviceAccount.name=aws-load-balancer-controller \
+                      --wait
+          
+          # 10. 모니터링 도구 설치 (Prometheus & Grafana)
+                      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+                      helm repo update
+                      helm install monitoring-stack prometheus-community/kube-prometheus-stack --namespace monitoring
+          
+          # 11. ArgoCD 설치 (GitOps 엔진)
+                      kubectl create namespace argocd
+                      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 
-        # 8. 모니터링 도구 설치 (Prometheus & Grafana)
-          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-          helm repo update
-          helm install monitoring-stack prometheus-community/kube-prometheus-stack --namespace monitoring
+          # 12. ArgoCD를 외부에서 접속 가능하도록 설정 (LoadBalancer 타입)
+                      # ALB Controller가 설치되어 있으므로 Ingress로 생성해도 되지만, 
+                      # 실습 편의상 Service 타입을 변경하여 ALB 생성을 유도합니다.
+                      kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+  
+                      # 12. App-of-Apps 패턴 (ArgoCD가 자신의 설정을 Git에서 가져오게 함)
+                      # DE님의 Git 리포지토리가 준비되었다면 아래 주석을 해제하여 자동 연결 가능합니다.
+                      # kubectl apply -f - <<EOF
+                      # apiVersion: argoproj.io/v1alpha1
+                      # kind: Application
+                      # metadata:
+                      #   name: root-application
+                      #   namespace: argocd
+                      # spec:
+                      #   project: default
+                      #   source:
+                      #     repoURL: 'https://github.com/YOUR_GIT_ID/de-camping-msa-gitops.git'
+                      #     targetRevision: HEAD
+                      #     path: root
+                      #   destination:
+                      #     server: 'https://kubernetes.default.svc'
+                      #     namespace: argocd
+                      # EOF
   # ==========================================
   # 6. Public EC2 Instances
   ## 해당 부분 ingress 설정으로 test 코드 삭제함
@@ -340,37 +413,37 @@ Resources:
   # ==========================================
   # 7. Private DB EC2 Instances (EBS 명시적 추가 할당)
   # ==========================================
-#  PrivateDB1:
-#    Type: AWS::EC2::Instance
-#    Properties:
-#      InstanceType: t3.medium
-#      ImageId: !Ref LatestAmiId
-#      KeyName: !Ref KeyName
-#      SubnetId: !Ref PrivateDBSubnet1
-#      SecurityGroupIds: [!Ref DBSG]
-#      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-1" }]
-#      BlockDeviceMappings:
-#        - DeviceName: /dev/sdf
-#          Ebs:
-#            VolumeSize: 50
-#            VolumeType: gp3
-#            DeleteOnTermination: false
-#
-#  PrivateDB2:
-#    Type: AWS::EC2::Instance
-#    Properties:
-#      InstanceType: t3.medium
-#      ImageId: !Ref LatestAmiId
-#      KeyName: !Ref KeyName
-#      SubnetId: !Ref PrivateDBSubnet2
-#      SecurityGroupIds: [!Ref DBSG]
-#      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-2" }]
-#      BlockDeviceMappings:
-#        - DeviceName: /dev/sdf
-#          Ebs:
-#            VolumeSize: 50
-#            VolumeType: gp3
-#            DeleteOnTermination: false
+  #  PrivateDB1:
+  #    Type: AWS::EC2::Instance
+  #    Properties:
+  #      InstanceType: t3.medium
+  #      ImageId: !Ref LatestAmiId
+  #      KeyName: !Ref KeyName
+  #      SubnetId: !Ref PrivateDBSubnet1
+  #      SecurityGroupIds: [!Ref DBSG]
+  #      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-1" }]
+  #      BlockDeviceMappings:
+  #        - DeviceName: /dev/sdf
+  #          Ebs:
+  #            VolumeSize: 50
+  #            VolumeType: gp3
+  #            DeleteOnTermination: false
+  #
+  #  PrivateDB2:
+  #    Type: AWS::EC2::Instance
+  #    Properties:
+  #      InstanceType: t3.medium
+  #      ImageId: !Ref LatestAmiId
+  #      KeyName: !Ref KeyName
+  #      SubnetId: !Ref PrivateDBSubnet2
+  #      SecurityGroupIds: [!Ref DBSG]
+  #      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-2" }]
+  #      BlockDeviceMappings:
+  #        - DeviceName: /dev/sdf
+  #          Ebs:
+  #            VolumeSize: 50
+  #            VolumeType: gp3
+  #            DeleteOnTermination: false
 
   # ==========================================
   # 8. EKS Cluster & App NodeGroup
@@ -396,6 +469,8 @@ Resources:
         - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
         - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
         - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" # 노드 트러블슈팅용 SSM 접근 권한
+        # 볼륨은 일단, 주석처리하고 실행한다.
+        # - "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" # <--- 추가: DB 볼륨 관리용
       # 커스텀 권한(Inline Policy) 직접 명시 영역
       Policies:
         - PolicyName: !Sub "${ServiceName}-node-custom-policy"
@@ -416,6 +491,16 @@ Resources:
       ResourcesVpcConfig:
         SubnetIds: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
         SecurityGroupIds: [ !GetAtt EksNodeSG.GroupId ]
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP # API 방식 활성화 (Access Entry 사용을 위해 필수)
+
+   # EBS 설정은 일단, 비활성 상태로 둔다.
+#  EbsCsiDriverAddon:
+#    Type: AWS::EKS::Addon
+#    Properties:
+#      AddonName: aws-ebs-csi-driver
+#      ClusterName: !Ref EksCluster
+#      ResolveConflicts: OVERWRITE
 
   PrivateAppNodeGroup:
     Type: AWS::EKS::Nodegroup
@@ -427,6 +512,9 @@ Resources:
       Subnets: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
       InstanceTypes: [ "t3.medium" ]
       ScalingConfig: { MinSize: 2, DesiredSize: 2, MaxSize: 4 }
+      Tags:
+        Name: !Sub "${ServiceName}-app-node" # 이 태그가 EC2의 'Name' 필드로 표시됩니다.
+        Project: !Ref ServiceName
 
   ## Karpenter로 생성된 EC2 instance가,cluster 아래에서 관리되게 하기 위한 설정.
   # IAM Role
