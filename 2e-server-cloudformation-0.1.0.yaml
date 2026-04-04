@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced MSA Infrastructure: Parameterized IP, Public EC2, DB with EBS, and EKS for Nginx/WAS Pods'
+
+Parameters:
+  ServiceName:
+    Type: String
+    Default: 'de-camping-msa'
+    Description: 'Service name prefix for resource tagging'
+
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: 'Select an existing EC2 KeyPair for SSH access'
+
+  # --- IP 대역 파라미터 ---
+  VpcCidrBlock: { Type: String, Default: '10.0.0.0/20' }
+  PublicSubnet1Cidr: { Type: String, Default: '10.0.0.0/24' }
+  PublicSubnet2Cidr: { Type: String, Default: '10.0.1.0/24' }
+  PrivateDBSubnet1Cidr: { Type: String, Default: '10.0.2.0/24' }
+  PrivateDBSubnet2Cidr: { Type: String, Default: '10.0.3.0/24' }
+  PrivateAppSubnet1Cidr: { Type: String, Default: '10.0.4.0/22' }
+  PrivateAppSubnet2Cidr: { Type: String, Default: '10.0.8.0/22' }
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
+  
+  KubernetesVersion:
+    Type: String
+    Default: '1.29'
+
+Resources:
+  # ==========================================
+  # 1. VPC & IGW
+  # ==========================================
+  MainVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: { Tags: [{ Key: Name, Value: !Sub "${ServiceName}-igw" }] }
+      
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref MainVPC, InternetGatewayId: !Ref InternetGateway }
+
+  # ==========================================
+  # 2. Subnets (2중화)
+  # ==========================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags: 
+        - { Key: Name, Value: !Sub "${ServiceName}-public-1" }
+        - { Key: "kubernetes.io/role/elb", Value: "1" }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags: 
+        - { Key: Name, Value: !Sub "${ServiceName}-public-2" }
+        - { Key: "kubernetes.io/role/elb", Value: "1" }
+
+  PrivateAppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateAppSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags: 
+        - { Key: Name, Value: !Sub "${ServiceName}-private-app-1" }
+        - { Key: "kubernetes.io/role/internal-elb", Value: "1" }
+
+  PrivateAppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateAppSubnet2Cidr
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags: 
+        - { Key: Name, Value: !Sub "${ServiceName}-private-app-2" }
+        - { Key: "kubernetes.io/role/internal-elb", Value: "1" }
+
+  PrivateDBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateDBSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-1" }]
+
+  PrivateDBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateDBSubnet2Cidr
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-2" }]
+
+  # ==========================================
+  # 3. NAT & Routing
+  # ==========================================
+  NatEIP1: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
+  NatEIP2: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
+  
+  NatGW1: 
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt NatEIP1.AllocationId, SubnetId: !Ref PublicSubnet1, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-nat-1" }] }
+  NatGW2: 
+    Type: AWS::EC2::NatGateway
+    Properties: { AllocationId: !GetAtt NatEIP2.AllocationId, SubnetId: !Ref PublicSubnet2, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-nat-2" }] }
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MainVPC, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-public-rt" }] }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PublicRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
+  
+  PrivateAppRT1:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MainVPC, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-app-rt-1" }] }
+  PrivateRouteApp1:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PrivateAppRT1, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGW1 }
+
+  PrivateAppRT2:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MainVPC, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-app-rt-2" }] }
+  PrivateRouteApp2:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PrivateAppRT2, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGW2 }
+
+  # Route Table Associations
+  RTAssocPub1: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRT } }
+  RTAssocPub2: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRT } }
+  RTAssocPrivApp1: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PrivateAppSubnet1, RouteTableId: !Ref PrivateAppRT1 } }
+  RTAssocPrivApp2: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PrivateAppSubnet2, RouteTableId: !Ref PrivateAppRT2 } }
+  
+  # [문법 교정 부분] DB Subnets are completely isolated (No Internet/NAT route)
+  # DB 전용 격리 라우팅 테이블 명시적 생성 및 연결
+  PrivateDBRT:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      VpcId: !Ref MainVPC
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-rt" }]
+
+  RTAssocPrivDB1: 
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      SubnetId: !Ref PrivateDBSubnet1
+      RouteTableId: !Ref PrivateDBRT
+      
+  RTAssocPrivDB2: 
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      SubnetId: !Ref PrivateDBSubnet2
+      RouteTableId: !Ref PrivateDBRT
+  # ==========================================
+  # 4. Security Groups
+  # ==========================================
+  BastionSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }]
+
+  PublicAppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public App SG
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !GetAtt BastionSG.GroupId }
+
+  EksNodeSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for EKS App Nodes
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 65535, CidrIp: !Ref VpcCidrBlock } # VPC 내부 라우팅 전체 허용
+
+  DBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for DB EC2
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !GetAtt EksNodeSG.GroupId } # WAS Pods -> DB
+
+  # ==========================================
+  # 5. Bastion (AWS 공식 CLI 도구 탑재 및 인증 자동화)
+  # ==========================================
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/AdministratorAccess" ]
+  BastionProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [ !Ref BastionRole ] }
+
+  BastionServer:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.nano
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds: [!Ref BastionSG]
+      IamInstanceProfile: !Ref BastionProfile
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-bastion" }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          dnf update -y && dnf install -y unzip wget tar
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip && ./aws/install
+          curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.29.0/2024-01-04/bin/linux/amd64/kubectl
+          chmod +x ./kubectl && mv ./kubectl /usr/local/bin/kubectl
+          curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
+          mv /tmp/eksctl /usr/local/bin
+
+  # ==========================================
+  # 6. Public EC2 Instances
+  # ==========================================
+  PublicInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds: [!Ref PublicAppSG]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-public-1" }]
+
+  PublicInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroupIds: [!Ref PublicAppSG]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-public-2" }]
+
+  # ==========================================
+  # 7. Private DB EC2 Instances (EBS 명시적 추가 할당)
+  # ==========================================
+  PrivateDB1:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PrivateDBSubnet1
+      SecurityGroupIds: [!Ref DBSG]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-1" }]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sdf
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            DeleteOnTermination: false
+
+  PrivateDB2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PrivateDBSubnet2
+      SecurityGroupIds: [!Ref DBSG]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-2" }]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sdf
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            DeleteOnTermination: false
+
+  # ==========================================
+  # 8. EKS Cluster & App NodeGroup
+  # ==========================================
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: eks.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy" ]
+
+  EksNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+        - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub "${ServiceName}-cluster"
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
+        SecurityGroupIds: [ !GetAtt EksNodeSG.GroupId ]
+
+  PrivateAppNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EksCluster
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodegroupName: !Sub "${ServiceName}-private-app-nodes"
+      NodeRole: !GetAtt EksNodeRole.Arn
+      Subnets: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
+      InstanceTypes: [ "t3.medium" ]
+      ScalingConfig: { MinSize: 2, DesiredSize: 2, MaxSize: 4 }
