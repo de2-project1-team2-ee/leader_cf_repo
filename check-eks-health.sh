@@ -1,83 +1,119 @@
 #!/bin/bash
+# EKS Infrastructure Full Verification Script
+set -u
 
-# ==============================================================================
-# EKS Cluster Clean-up Script (대화형 입력 & Region 자동 추출 지원)
-# 실행 명령어
-# sh ./clean-up.sh
-# 위 구문 실행 후, stack 생성 당시 할당한 service 명칭 기입시,
-# 스택 1: Karpenter 컨트롤러용 IAM Role 생성 스택
-# 스택 2: AWS Load Balancer (ALB) 컨트롤러용 IAM Role 생성 스택
-# 위에 해당되는 스택이 모두 삭제 됨.
-# ==============================================================================
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m'
 
-echo "==========================================================="
-echo "🧹 EKS 내부 리소스 자동 정리를 시작합니다..."
-echo "==========================================================="
+echo -e "${GREEN}===========================================================${NC}"
+echo -e "🔎 EKS 인프라 및 애플리케이션 통합 진단을 시작합니다..."
+echo -e "${GREEN}===========================================================${NC}"
 
-# 1. ServiceName 대화형 입력 받기 (파라미터가 없으면 물어봄)
-if [ -z "$1" ]; then
-    read -p "▶ 삭제할 인프라의 ServiceName을 입력하세요 (엔터 시 기본값 'de-camping-msa' 적용): " INPUT_NAME
-    SERVICE_NAME=${INPUT_NAME:-"de-camping-msa"}
-else
-    SERVICE_NAME=$1
-fi
-
-CLUSTER_NAME="${SERVICE_NAME}-cluster"
-
-echo "✅ 선택된 ServiceName: $SERVICE_NAME"
-echo "✅ 타겟 클러스터: $CLUSTER_NAME"
-echo "-----------------------------------------------------------"
-
-# 2. AWS Region 자동 추출 (IMDSv2 토큰 기반 안전한 추출 방식)
-echo "[Step 1] AWS Region 정보 추출 중..."
-TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-
-if [ -n "$TOKEN" ]; then
-    REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
-else
-    # 메타데이터 추출 실패 시 AWS CLI 기본 설정값으로 Fallback
-    REGION=$(aws configure get region)
-fi
-
-if [ -z "$REGION" ]; then
-    echo "❌ Region 정보를 가져올 수 없습니다. 스크립트를 종료합니다."
+# 클러스터 및 환경 변수 자동 설정
+CLUSTER_NAME=$(aws eks list-clusters --query "clusters[0]" --output text 2>/dev/null)
+if [[ -z "$CLUSTER_NAME" || "$CLUSTER_NAME" == "None" ]]; then
+    echo -e "${RED}❌ EKS 클러스터를 찾을 수 없습니다.${NC}"
     exit 1
 fi
+SERVICE_NAME=${CLUSTER_NAME%-cluster}
 
-echo "✅ 타겟 Region: $REGION"
-echo "-----------------------------------------------------------"
+# 사용자로부터 네임스페이스 입력받기 (CFN의 AppEnvironment 파라미터 대응)
+read -p "▶ 검증할 앱의 네임스페이스 환경을 입력하세요 (dev/stg/prod) [기본값: dev]: " INPUT_NS
+APP_NS=${INPUT_NS:-"dev"}
+APP_NAME="${SERVICE_NAME}-app"
 
-# 3. Karpenter 리소스 삭제 (EC2 인스턴스 자동 반납 유도)
-echo "[Step 2] Karpenter NodePool 및 EC2NodeClass 삭제 중 (EC2 반납)..."
-kubectl delete nodepool --all --timeout=60s 2>/dev/null || echo "▶ NodePool이 이미 없거나 삭제되었습니다."
-kubectl delete ec2nodeclass --all --timeout=60s 2>/dev/null || echo "▶ EC2NodeClass가 이미 없거나 삭제되었습니다."
+echo -e "✅ 검증 대상 클러스터: ${YELLOW}$CLUSTER_NAME${NC}"
+echo -e "✅ 검증 대상 네임스페이스: ${YELLOW}$APP_NS${NC}\n"
 
-# 4. AWS ALB/NLB 삭제 유도 (Ingress 및 LoadBalancer 서비스 삭제)
-echo "[Step 3] 외부 LoadBalancer 리소스 삭제 유도 중..."
-kubectl delete ingress --all --all-namespaces --timeout=60s 2>/dev/null || echo "▶ Ingress가 이미 없거나 삭제되었습니다."
-kubectl delete svc argocd-server -n argocd --timeout=60s 2>/dev/null || echo "▶ ArgoCD Service가 이미 없거나 삭제되었습니다."
+# ---------------------------------------------------------
+# 1. 노드 및 VPC CNI 상태 체크
+# ---------------------------------------------------------
+echo -e "${GREEN}>>> [1/7] Node & VPC CNI Status...${NC}"
+kubectl get nodes
 
-# 5. eksctl이 생성한 IAM Service Account(유령 CF 스택) 삭제
-echo "[Step 4] eksctl CF 스택 삭제 중 (약 1~2분 소요)..."
+PREFIX_DELEGATION=$(kubectl get daemonset aws-node -n kube-system -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="ENABLE_PREFIX_DELEGATION")].value}')
+WARM_TARGET=$(kubectl get daemonset aws-node -n kube-system -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="WARM_PREFIX_TARGET")].value}')
 
-# Karpenter IAM 삭제
-if eksctl get iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --namespace karpenter --name karpenter 2>/dev/null | grep -q karpenter; then
-    echo "▶ Karpenter IAM Service Account 삭제 진행..."
-    eksctl delete iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --name karpenter --namespace karpenter
+if [[ "$PREFIX_DELEGATION" == "true" && "$WARM_TARGET" == "1" ]]; then
+    echo -e "✅ VPC CNI Prefix Delegation is ON (Target: 1)"
 else
-    echo "▶ Karpenter IAM Service Account가 이미 존재하지 않습니다."
+    echo -e "${RED}❌ VPC CNI 설정이 올바르지 않습니다. (Prefix Delegation: $PREFIX_DELEGATION)${NC}"
 fi
 
-# ALB Controller IAM 삭제
-if eksctl get iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --namespace kube-system --name aws-load-balancer-controller 2>/dev/null | grep -q aws-load-balancer-controller; then
-    echo "▶ ALB Controller IAM Service Account 삭제 진행..."
-    eksctl delete iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --name aws-load-balancer-controller --namespace kube-system
+# ---------------------------------------------------------
+# 2. Karpenter 체크
+# ---------------------------------------------------------
+echo -e "\n${GREEN}>>> [2/7] Karpenter Status...${NC}"
+KARPENTER_POD=$(kubectl get pods -n karpenter -l app.kubernetes.io/name=karpenter -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+if [[ "$KARPENTER_POD" == "Running" ]]; then
+    echo -e "✅ Karpenter Pod is Running"
+    kubectl get nodepool,ec2nodeclass
 else
-    echo "▶ ALB Controller IAM Service Account가 이미 존재하지 않습니다."
+    echo -e "${RED}❌ Karpenter Pod is not running ($KARPENTER_POD)${NC}"
 fi
 
-echo "==========================================================="
-echo "🎉 [$SERVICE_NAME] EKS 내부 리소스 정리가 완료되었습니다!"
-echo "AWS 콘솔에서 EC2(App Node)와 LoadBalancer가 사라졌는지 확인한 후,"
-echo "CloudFormation 콘솔에서 메인 스택을 삭제해 주세요."
-echo "==========================================================="
+# ---------------------------------------------------------
+# 3. AWS Load Balancer Controller 체크
+# ---------------------------------------------------------
+echo -e "\n${GREEN}>>> [3/7] AWS ALB Controller Status...${NC}"
+ALB_POD=$(kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+if [[ "$ALB_POD" == "Running" ]]; then
+    echo -e "✅ ALB Controller Pod is Running"
+else
+    echo -e "${RED}❌ ALB Controller Pod is not running ($ALB_POD)${NC}"
+fi
+
+# ---------------------------------------------------------
+# 4. 모니터링 스택 (Grafana/Prometheus) 체크
+# ---------------------------------------------------------
+echo -e "\n${GREEN}>>> [4/7] Monitoring Stack (Grafana)...${NC}"
+GRAFANA_URL=$(kubectl get svc -n monitoring monitoring-stack-grafana -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+if [[ -n "$GRAFANA_URL" ]]; then
+    echo -e "✅ Grafana LoadBalancer Assigned: http://$GRAFANA_URL"
+else
+    echo -e "${YELLOW}⚠️ Grafana LoadBalancer is provisioning or missing.${NC}"
+fi
+
+# ---------------------------------------------------------
+# 5. ArgoCD 체크
+# ---------------------------------------------------------
+echo -e "\n${GREEN}>>> [5/7] ArgoCD Status...${NC}"
+ARGOCD_URL=$(kubectl get svc -n argocd argocd-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+if [[ -n "$ARGOCD_URL" ]]; then
+    echo -e "✅ ArgoCD LoadBalancer Assigned: https://$ARGOCD_URL"
+else
+    echo -e "${YELLOW}⚠️ ArgoCD LoadBalancer is provisioning or missing.${NC}"
+fi
+
+# ---------------------------------------------------------
+# 6. Metrics Server & HPA 체크
+# ---------------------------------------------------------
+echo -e "\n${GREEN}>>> [6/7] Metrics Server & HPA...${NC}"
+METRICS_POD=$(kubectl get pods -n kube-system -l k8s-app=metrics-server -o jsonpath='{.items[0].status.phase}' 2>/dev/null || echo "NotFound")
+if [[ "$METRICS_POD" == "Running" ]]; then
+    echo -e "✅ Metrics Server is Running"
+else
+    echo -e "${RED}❌ Metrics Server is not running ($METRICS_POD)${NC}"
+fi
+
+kubectl get hpa ${APP_NAME}-hpa -n ${APP_NS} 2>/dev/null || echo -e "${RED}❌ HPA not found in namespace ${APP_NS}${NC}"
+
+# ---------------------------------------------------------
+# 7. Sample App (Ingress) 체크
+# ---------------------------------------------------------
+echo -e "\n${GREEN}>>> [7/7] Sample App & Ingress Status (${APP_NS})...${NC}"
+APP_PODS=$(kubectl get pods -n ${APP_NS} -l app=${APP_NAME} | grep -c "Running" || echo 0)
+echo -e "✅ Running App Pods: $APP_PODS"
+
+INGRESS_URL=$(kubectl get ingress ${SERVICE_NAME}-ingress -n ${APP_NS} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+if [[ -n "$INGRESS_URL" ]]; then
+    echo -e "✅ Sample App Ingress Assigned: http://$INGRESS_URL"
+else
+    echo -e "${YELLOW}⚠️ Ingress ALB is provisioning or missing.${NC}"
+fi
+
+echo -e "\n${GREEN}===========================================================${NC}"
+echo -e "🎉 검증이 완료되었습니다!"
+echo -e "${GREEN}===========================================================${NC}"
