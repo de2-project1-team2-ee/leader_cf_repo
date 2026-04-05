@@ -1,121 +1,83 @@
 #!/bin/bash
-# EKS Cluster Health Checker
-# CFN을 통해서 생성 된 설정들의 유효성을 체크합니다.
-set -u
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-NC='\033[0m'
+# ==============================================================================
+# EKS Cluster Clean-up Script (대화형 입력 & Region 자동 추출 지원)
+# 실행 명령어
+# sh ./clean-up.sh
+# 위 구문 실행 후, stack 생성 당시 할당한 service 명칭 기입시,
+# 스택 1: Karpenter 컨트롤러용 IAM Role 생성 스택
+# 스택 2: AWS Load Balancer (ALB) 컨트롤러용 IAM Role 생성 스택
+# 위에 해당되는 스택이 모두 삭제 됨.
+# ==============================================================================
 
-# [추가] 서비스 이름 입력 받기
-echo -e "${GREEN}입력하신 서비스 이름에 '-cluster'를 붙여 점검을 시작합니다.${NC}"
+echo "==========================================================="
+echo "🧹 EKS 내부 리소스 자동 정리를 시작합니다..."
+echo "==========================================================="
 
-## Before
-#read -p "서비스 이름을 입력하세요 (예: de-camping-msa): " INPUT_SERVICE_NAME
-## 입력값이 없을 경우 기본값 설정 또는 종료
-#if [[ -z "$INPUT_SERVICE_NAME" ]]; then
-#    echo -e "${RED}❌ 서비스 이름이 입력되지 않았습니다. 종료합니다.${NC}"
-#    exit 1
-#fi
-#
-## 클러스터명 생성 (CFN 명명 규칙 반영)
-#CLUSTER_NAME="${INPUT_SERVICE_NAME}-cluster"
-#echo -e "🔍 점검 대상 클러스터: ${GREEN}$CLUSTER_NAME${NC}\n"
-###
+# 1. ServiceName 대화형 입력 받기 (파라미터가 없으면 물어봄)
+if [ -z "$1" ]; then
+    read -p "▶ 삭제할 인프라의 ServiceName을 입력하세요 (엔터 시 기본값 'de-camping-msa' 적용): " INPUT_NAME
+    SERVICE_NAME=${INPUT_NAME:-"de-camping-msa"}
+else
+    SERVICE_NAME=$1
+fi
 
-## After
-# 현재 리전에 있는 첫 번째 EKS 클러스터 이름을 가져옵니다.
-CLUSTER_NAME=$(aws eks list-clusters --query "clusters[0]" --output text)
-# 클러스터를 찾지 못했을 경우 예외 처리
-if [[ -z "$CLUSTER_NAME" || "$CLUSTER_NAME" == "None" ]]; then
-    echo -e "${RED}❌ EKS 클러스터를 찾을 수 없습니다. CloudFormation 배포 상태를 확인하세요.${NC}"
+CLUSTER_NAME="${SERVICE_NAME}-cluster"
+
+echo "✅ 선택된 ServiceName: $SERVICE_NAME"
+echo "✅ 타겟 클러스터: $CLUSTER_NAME"
+echo "-----------------------------------------------------------"
+
+# 2. AWS Region 자동 추출 (IMDSv2 토큰 기반 안전한 추출 방식)
+echo "[Step 1] AWS Region 정보 추출 중..."
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+if [ -n "$TOKEN" ]; then
+    REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+else
+    # 메타데이터 추출 실패 시 AWS CLI 기본 설정값으로 Fallback
+    REGION=$(aws configure get region)
+fi
+
+if [ -z "$REGION" ]; then
+    echo "❌ Region 정보를 가져올 수 없습니다. 스크립트를 종료합니다."
     exit 1
 fi
-echo -e "🔍 Detected Cluster: ${GREEN}$CLUSTER_NAME${NC}\n"
-###
 
-echo -e "${GREEN}>>> [1/6] Checking Node Status...${NC}"
-READY_NODES=$(kubectl get nodes --no-headers | grep -c "Ready" || echo 0)
-TOTAL_NODES=$(kubectl get nodes --no-headers | wc -l)
-if [ "$READY_NODES" -eq "$TOTAL_NODES" ] && [ "$TOTAL_NODES" -gt 0 ]; then
-    echo -e "✅ Nodes are Healthy: ($READY_NODES/$TOTAL_NODES)"
+echo "✅ 타겟 Region: $REGION"
+echo "-----------------------------------------------------------"
+
+# 3. Karpenter 리소스 삭제 (EC2 인스턴스 자동 반납 유도)
+echo "[Step 2] Karpenter NodePool 및 EC2NodeClass 삭제 중 (EC2 반납)..."
+kubectl delete nodepool --all --timeout=60s 2>/dev/null || echo "▶ NodePool이 이미 없거나 삭제되었습니다."
+kubectl delete ec2nodeclass --all --timeout=60s 2>/dev/null || echo "▶ EC2NodeClass가 이미 없거나 삭제되었습니다."
+
+# 4. AWS ALB/NLB 삭제 유도 (Ingress 및 LoadBalancer 서비스 삭제)
+echo "[Step 3] 외부 LoadBalancer 리소스 삭제 유도 중..."
+kubectl delete ingress --all --all-namespaces --timeout=60s 2>/dev/null || echo "▶ Ingress가 이미 없거나 삭제되었습니다."
+kubectl delete svc argocd-server -n argocd --timeout=60s 2>/dev/null || echo "▶ ArgoCD Service가 이미 없거나 삭제되었습니다."
+
+# 5. eksctl이 생성한 IAM Service Account(유령 CF 스택) 삭제
+echo "[Step 4] eksctl CF 스택 삭제 중 (약 1~2분 소요)..."
+
+# Karpenter IAM 삭제
+if eksctl get iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --namespace karpenter --name karpenter 2>/dev/null | grep -q karpenter; then
+    echo "▶ Karpenter IAM Service Account 삭제 진행..."
+    eksctl delete iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --name karpenter --namespace karpenter
 else
-    echo -e "${RED}❌ Node Issue Detected! Ready: $READY_NODES, Total: $TOTAL_NODES${NC}"
+    echo "▶ Karpenter IAM Service Account가 이미 존재하지 않습니다."
 fi
 
-# [추가] 네임스페이스 존재 여부 체크
-echo -e "\n${GREEN}>>> [2/6] Checking Required Namespaces...${NC}"
-REQUIRED_NS=("dev" "stg" "prod" "monitoring" "argocd" "karpenter" "kube-system")
-MISSING_NS=()
-
-for NS in "${REQUIRED_NS[@]}"; do
-    if kubectl get namespace "$NS" &>/dev/null; then
-        echo -e "✅ Namespace '$NS': Found"
-    else
-        echo -e "${RED}❌ Namespace '$NS': NOT FOUND${NC}"
-        MISSING_NS+=("$NS")
-    fi
-done
-
-echo -e "\n${GREEN}>>> [3/6] Checking System Pods (Critical)...${NC}"
-COMPONENTS=("karpenter" "aws-load-balancer-controller" "argocd-server")
-for COMP in "${COMPONENTS[@]}"; do
-    # 특정 컴포넌트가 어느 네임스페이스에 있든 상관없이 Running 상태인지 체크
-    STATUS=$(kubectl get pods -A | grep "$COMP" | awk '{print $4}' | grep "Running" | head -n 1 || echo "NotRunning")
-    if [[ "$STATUS" == "Running" ]]; then
-        echo -e "✅ $COMP: Running"
-    else
-        echo -e "${RED}❌ $COMP: Status is $STATUS${NC}"
-    fi
-done
-
-echo -e "\n${GREEN}>>> [4/6] Checking OIDC & IRSA...${NC}"
-#CLUSTER_NAME="de-camping-msa-cluster" # 실제 클러스터명으로 확인 필요
-#OIDC_URL=$(aws eks describe-cluster --name $CLUSTER_NAME --query "cluster.identity.oidc.issuer" --output text | cut -d '/' -f 5)
-
-### [Before]
-#OIDC_URL=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.identity.oidc.issuer" --output text 2>/dev/null | cut -d '/' -f 5 || echo "")
-#
-#if [[ -z "$OIDC_URL" ]]; then
-#    echo -e "${RED}❌ 클러스터 '$CLUSTER_NAME'을 찾을 수 없습니다. 이름을 확인해주세요.${NC}"
-#else
-#  IAM_OIDC=$(aws iam list-open-id-connect-providers | grep "$OIDC_URL" || true)
-#  if [[ -n "$IAM_OIDC" ]]; then
-#      echo -e "✅ OIDC Provider Linked"
-#  else
-#      echo -e "${RED}❌ OIDC Provider NOT Found!${NC}"
-#  fi
-#fi
-
-###
-### [After]
-OIDC_URL=$(aws eks describe-cluster --name "$CLUSTER_NAME" --query "cluster.identity.oidc.issuer" --output text 2>/dev/null | cut -d '/' -f 5 || echo "")
-
-if [[ -z "$OIDC_URL" ]]; then
-    echo -e "${RED}❌ 클러스터 '$CLUSTER_NAME' 정보를 가져오는데 실패했습니다.${NC}"
+# ALB Controller IAM 삭제
+if eksctl get iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --namespace kube-system --name aws-load-balancer-controller 2>/dev/null | grep -q aws-load-balancer-controller; then
+    echo "▶ ALB Controller IAM Service Account 삭제 진행..."
+    eksctl delete iamserviceaccount --cluster "$CLUSTER_NAME" --region "$REGION" --name aws-load-balancer-controller --namespace kube-system
 else
-    IAM_OIDC=$(aws iam list-open-id-connect-providers | grep "$OIDC_URL" || true)
-    if [[ -n "$IAM_OIDC" ]]; then
-        echo -e "✅ OIDC Provider Linked"
-    else
-        echo -e "${RED}❌ OIDC Provider NOT Found!${NC}"
-    fi
-fi
-###
-
-echo -e "\n${GREEN}>>> [5/6] Checking Karpenter NodePool...${NC}"
-if kubectl get nodepools.karpenter.sh default &>/dev/null; then
-    echo -e "✅ Karpenter NodePool 'default' is present"
-else
-    echo -e "${RED}❌ Karpenter NodePool NOT found${NC}"
+    echo "▶ ALB Controller IAM Service Account가 이미 존재하지 않습니다."
 fi
 
-echo -e "\n${GREEN}>>> [6/6] Checking ArgoCD Access...${NC}"
-ARGOCD_SVC_TYPE=$(kubectl get svc -n argocd argocd-server -o jsonpath='{.spec.type}' 2>/dev/null || echo "NotFound")
-if [[ "$ARGOCD_SVC_TYPE" != "NotFound" ]]; then
-    echo -e "✅ ArgoCD Service Type: $ARGOCD_SVC_TYPE"
-else
-    echo -e "${RED}❌ ArgoCD Service NOT found${NC}"
-fi
-
-echo -e "\n${GREEN}>>> Health Check Completed!${NC}"
+echo "==========================================================="
+echo "🎉 [$SERVICE_NAME] EKS 내부 리소스 정리가 완료되었습니다!"
+echo "AWS 콘솔에서 EC2(App Node)와 LoadBalancer가 사라졌는지 확인한 후,"
+echo "CloudFormation 콘솔에서 메인 스택을 삭제해 주세요."
+echo "==========================================================="
