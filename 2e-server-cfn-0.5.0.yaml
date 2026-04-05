@@ -12,6 +12,8 @@ Metadata:
           - ServiceName
           - KeyName
           - KubernetesVersion
+          - BastionInstanceType
+          - AppNodeInstanceType
       - Label:
           default: "2. Network & Infra Setting (VPC & Subnets)"
         Parameters:
@@ -45,6 +47,13 @@ Metadata:
         default: "Private App Subnet 2 CIDR (Nodes)"
 
 Parameters:
+  # [추가됨] 앱 배포용 네임스페이스 환경 설정
+  AppEnvironment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: [ 'dev', 'stg', 'prod' ]
+    Description: 'Target namespace for the application deployment (e.g., dev, stg, prod)'
+
   ServiceName:
     Type: String
     Default: 'de-camping-msa'
@@ -53,6 +62,18 @@ Parameters:
   KeyName:
     Type: 'AWS::EC2::KeyPair::KeyName'
     Description: 'Select an existing EC2 KeyPair for SSH access'
+
+  BastionInstanceType:
+    Type: String
+    Default: 't3.small'
+    AllowedValues: [ 't3.small', 't3.medium' ]
+    Description: 'Select EC2 instance type for the Bastion Server'
+
+  AppNodeInstanceType:
+    Type: String
+    Default: 't3.medium'
+    AllowedValues: [ 't3.small', 't3.medium', 't3.large', 'm5.large', 'c5.large' ]
+    Description: 'Select EC2 instance type for EKS App Nodes (Managed & Karpenter)'
 
   # --- IP 대역 파라미터 ---
   ## 대역 설정시, 중복 방지를 위해서. 마스킹 된 앞에서부터 20비트대부터 주소를 할당해야 합니다.
@@ -279,19 +300,17 @@ Resources:
 
   ## public Subnet, 보안 그룹 설정
   # 해당 영역, Karpenter를 이용한 Ingress 설정 및 LoadBalancer 설정
-  ## 검색어 --> 9. AWS Load Balancer Controller 설치 (Ingress 지원용)
-  # 으로, 모두 주석 처리.
-
-#  PublicAppSG:
-#    Type: AWS::EC2::SecurityGroup
-#    Properties:
-#      GroupDescription: Public App SG (ALB)
-#      VpcId: !Ref MainVPC
-#      SecurityGroupIngress:
-#        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
-#        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !GetAtt BastionSG.GroupId }
-#      Tags:
-#        - { Key: Name, Value: !Sub "${ServiceName}-alb-sg" }
+  ## 검색어 --> AWS Load Balancer Controller 설치 (Ingress 지원용)
+  PublicAppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public App SG (ALB)
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !GetAtt BastionSG.GroupId }
+      Tags:
+        - { Key: Name, Value: !Sub "${ServiceName}-alb-sg" }
 
   ## Eks Node Group(현재 설정상 Private App 영역, 보안그룹 설정)
   EksNodeSG:
@@ -302,6 +321,7 @@ Resources:
       SecurityGroupIngress:
         - { IpProtocol: tcp, FromPort: 80, ToPort: 65535,  CidrIp: !Ref VpcCidrBlock } # VPC 내부 라우팅 전체 허용
         - { IpProtocol: tcp, FromPort: 9443, ToPort: 9443, CidrIp: !Ref VpcCidrBlock }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref PublicAppSG }
       Tags: # <--- SecurityGroupIngress 밖으로 빼서 별도 정의해야 합니다.
         - { Key: "karpenter.sh/discovery", Value: !Sub "${ServiceName}-cluster" }
         - { Key: Name, Value: !Sub "${ServiceName}-eks-node-sg" }
@@ -354,7 +374,7 @@ Resources:
   BastionServer:
     Type: AWS::EC2::Instance
     Properties:
-      InstanceType: t3.small
+      InstanceType: !Ref BastionInstanceType # <--- 하드코딩(t3.small)에서 교체
       # t3.nano 로 했다가, eksctl 안되는 문제 생김;
       ImageId: !Ref LatestAmiId
       KeyName: !Ref KeyName
@@ -430,7 +450,21 @@ Resources:
               echo "Waiting for authorization... ($i/20)"
               sleep 15
             done
-          # --> 위 구문 없으면, eks cluster 생성만 되고 실행 확인 안된 상태로 넘어가서. 아래 구문들에서 에러납니다. 
+          # --> 위 구문 없으면, eks cluster 생성만 되고 실행 확인 안된 상태로 넘어가서. 아래 구문들에서 에러납니다.
+          
+          # ---------------------------------------------------------
+          # [신규 추가] AWS VPC CNI - Prefix Delegation 활성화 (Pod 동적 할당 극대화)
+          # 서버 선택 시, 서버(instance) 타입마다 ENI와 IP가 정해져있어. 대역폭의 낭비가 발생 가능함
+          # 아래는 그 부분에 대한, 대역폭 낭비를 막아주고 (IP 블럭 조정 등)
+          # 그만큼 node에 대한 할당을 유연하게 가져 가도록 설정한다.
+          # ---------------------------------------------------------
+            echo "Enable VPC CNI Prefix Delegation..."
+            # 1. Prefix 위임 기능 활성화 (t3.medium 기준 Pod 한도를 17개 -> 110개 폭증시킴)
+            kubectl set env daemonset aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true
+          
+            # 2. 너무 많은 여유 IP를 잡아먹지 않도록 웜풀(Warm Pool) 최적화
+            kubectl set env daemonset aws-node -n kube-system WARM_PREFIX_TARGET=1
+          # ---------------------------------------------------------
           
           ## 4. OIDC Provider 연결 (IRSA의 핵심), region 정보 추가.
             eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME \
@@ -505,7 +539,6 @@ Resources:
             helm upgrade --install monitoring-stack prometheus-community/kube-prometheus-stack --namespace monitoring \
               --set grafana.adminPassword='admin' \
               --set grafana.service.type=LoadBalancer \
-
               --wait
   
           # 10. ArgoCD 설치 (GitOps 엔진)
@@ -608,6 +641,9 @@ Resources:
                   - key: "kubernetes.io/arch"
                     operator: In
                     values: ["amd64"]
+                  - key: "node.kubernetes.io/instance-type"
+                    operator: In
+                    values: ["${AppNodeInstanceType}"]
             limits:
               cpu: 100
           ---
@@ -626,6 +662,108 @@ Resources:
             securityGroupSelectorTerms:
               - tags:
                   karpenter.sh/discovery: "${EksCluster}"
+          EOF
+          
+          # ---------------------------------------------------------
+          # 14. Metrics Server 설치 (HPA 작동을 위한 필수 메트릭 수집기)
+          # ---------------------------------------------------------
+            echo "Step 14: Install Metrics Server for HPA"
+            kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+          
+          # ---------------------------------------------------------
+          # 15. Ingress + HPA + Deployment 통합 배포 (샘플 WAS)
+          # ---------------------------------------------------------
+            APP_NAME="${ServiceName}-app"
+            APP_NS="${AppEnvironment}" # CFN 파라미터에서 선택한 환경값을 받아옴
+          
+            echo "Step 15: Deploy ${!APP_NAME} to namespace [${!APP_NS}] with HPA and Ingress"
+          # 혹시 모를 상황을 대비해 네임스페이스 생성 강제 실행 (안전장치)
+            kubectl create namespace ${!APP_NS} --dry-run=client -o yaml | kubectl apply -f -
+          
+            cat <<EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${!APP_NAME}
+            namespace: ${!APP_NS} # 동적 네임스페이스 할당
+          spec:
+            selector:
+              matchLabels:
+                app: ${!APP_NAME}
+            template:
+              metadata:
+                labels:
+                  app: ${!APP_NAME}
+              spec:
+                containers:
+                - name: was
+                  image: nginx:latest # 테스트용 Nginx 이미지, 추후 다른 이미지로 교체 필
+                  resources:
+                    requests:
+                      cpu: 100m     # HPA 계산의 기준점 (필수)
+                      memory: 128Mi
+                    limits:
+                      cpu: 250m
+                      memory: 256Mi
+                  ports:
+                  - containerPort: 80
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${!APP_NAME}-svc
+            namespace: ${!APP_NS} # 동적 네임스페이스 할당
+          spec:
+            selector:
+              app: ${!APP_NAME}
+            ports:
+              - protocol: TCP
+                port: 80
+                targetPort: 80
+            type: ClusterIP
+          ---
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: ${!APP_NAME}-hpa
+            namespace: ${!APP_NS} # 동적 네임스페이스 할당
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: ${!APP_NAME}
+            minReplicas: 2
+            maxReplicas: 10
+            metrics:
+            - type: Resource
+              resource:
+                name: cpu
+                target:
+                  type: Utilization
+                  averageUtilization: 50 # CPU 사용률이 50%를 넘으면 Pod 확장
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${ServiceName}-ingress
+            namespace: ${!APP_NS} # 동적 네임스페이스 할당
+            annotations:
+              alb.ingress.kubernetes.io/scheme: internet-facing
+              alb.ingress.kubernetes.io/target-type: ip
+              alb.ingress.kubernetes.io/security-groups: "${PublicAppSG}" # ALB에 보안그룹 자동 할당
+              alb.ingress.kubernetes.io/subnets: "${PublicSubnet1}, ${PublicSubnet2}"
+          spec:
+            ingressClassName: alb
+            rules:
+              - http:
+                  paths:
+                    - path: /
+                      pathType: Prefix
+                      backend:
+                        service:
+                          name: ${!APP_NAME}-svc
+                          port:
+                            number: 80
           EOF
   # ==========================================
   # 6. Public EC2 Instances
@@ -731,7 +869,7 @@ Resources:
       NodegroupName: !Sub "${ServiceName}-private-app-nodes"
       NodeRole: !GetAtt EksNodeRole.Arn
       Subnets: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
-      InstanceTypes: [ "t3.medium" ]
+      InstanceTypes: [ !Ref AppNodeInstanceType ]
       ScalingConfig: { MinSize: 2, DesiredSize: 2, MaxSize: 4 }
       Tags:
         Name: !Sub "${ServiceName}-app-node" # 이 태그가 EC2의 'Name' 필드로 표시됩니다.
