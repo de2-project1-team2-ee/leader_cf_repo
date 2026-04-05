@@ -4,7 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="5460748c-ee89-42c5-ab78-6fd510036fd6" name="Changes" comment="초기 CF 파일 업로드 (EBS 설정부 미제거, region 변수변환 작업 진행안됨, IP 대역 할당에 따른 추가 VPC 적용 여부확인 필요)" />
+    <list default="true" id="5460748c-ee89-42c5-ab78-6fd510036fd6" name="Changes" comment="초기 CF 파일 업로드 (EBS 설정부 미제거, region 변수변환 작업 진행안됨, IP 대역 할당에 따른 추가 VPC 적용 여부확인 필요)">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/2e-server-cfn-0.5.0.yaml" beforeDir="false" afterPath="$PROJECT_DIR$/2e-server-cfn-0.5.0.yaml" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -45,7 +48,7 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1775304857800</updated>
-      <workItem from="1775304859093" duration="20952000" />
+      <workItem from="1775304859093" duration="28360000" />
     </task>
     <servers />
   </component>

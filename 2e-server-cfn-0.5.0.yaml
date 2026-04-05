@@ -126,10 +126,36 @@ Resources:
 
   NatGW1:
     Type: AWS::EC2::NatGateway
-    Properties: { AllocationId: !GetAtt NatEIP1.AllocationId, SubnetId: !Ref PublicSubnet1, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-nat-1" }] }
+    DependsOn: AttachGateway # IGW가 VPC에 완전히 붙은 후 생성되도록 강제
+    Properties:
+      AllocationId: !GetAtt NatEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-nat-1" } ]
+
   NatGW2:
     Type: AWS::EC2::NatGateway
-    Properties: { AllocationId: !GetAtt NatEIP2.AllocationId, SubnetId: !Ref PublicSubnet2, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-nat-2" }] }
+    DependsOn: AttachGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-nat-2" } ]
+
+  # --- Private App Routing (AZ 1) ---
+  PrivateAppRT1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-private-app-rt-1" } ]
+
+
+  # --- Private App Routing (AZ 2) ---
+  PrivateAppRT2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-private-app-rt-2" } ]
+
+
 
   PublicRT:
     Type: AWS::EC2::RouteTable
@@ -138,25 +164,33 @@ Resources:
     Type: AWS::EC2::Route
     Properties: { RouteTableId: !Ref PublicRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
 
-  PrivateAppRT1:
-    Type: AWS::EC2::RouteTable
-    Properties: { VpcId: !Ref MainVPC, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-app-rt-1" }] }
   PrivateRouteApp1:
     Type: AWS::EC2::Route
-    Properties: { RouteTableId: !Ref PrivateAppRT1, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGW1 }
-
-  PrivateAppRT2:
-    Type: AWS::EC2::RouteTable
-    Properties: { VpcId: !Ref MainVPC, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-app-rt-2" }] }
+    Properties:
+      RouteTableId: !Ref PrivateAppRT1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW1
   PrivateRouteApp2:
     Type: AWS::EC2::Route
-    Properties: { RouteTableId: !Ref PrivateAppRT2, DestinationCidrBlock: 0.0.0.0/0, NatGatewayId: !Ref NatGW2 }
+    Properties:
+      RouteTableId: !Ref PrivateAppRT2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW2
 
   # Route Table Associations
   RTAssocPub1: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRT } }
   RTAssocPub2: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRT } }
-  RTAssocPrivApp1: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PrivateAppSubnet1, RouteTableId: !Ref PrivateAppRT1 } }
-  RTAssocPrivApp2: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PrivateAppSubnet2, RouteTableId: !Ref PrivateAppRT2 } }
+
+  RTAssocPrivApp1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      RouteTableId: !Ref PrivateAppRT1
+  RTAssocPrivApp2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet2
+      RouteTableId: !Ref PrivateAppRT2
 
   # [문법 교정 부분] DB Subnets are completely isolated (No Internet/NAT route)
   # DB 전용 격리 라우팅 테이블 명시적 생성 및 연결
@@ -289,10 +323,10 @@ Resources:
           ## 1. Bastion 서버 내부, 명령어 수행을 위한 준비
             set -ex # 에러 발생 시 즉시 중단 및 로그 출력
             exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-
+  
             echo "Step 1: Basic Tools"
             dnf update -y && dnf install -y unzip wget tar
-
+  
             echo "Step 2: Install CLI Tools"
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
             unzip awscliv2.zip && ./aws/install
@@ -309,10 +343,12 @@ Resources:
           
           ## 4. helm 설치
             curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-          
+  
           ## 5. EKS 접속 및 대기 (클러스터가 생성될 때까지 대기)
+          # ServiceName properties를 이용한 ClusterName 생성
             echo "Step 3: Wait for EKS Cluster to be ACTIVE"
             CLUSTER_NAME="${ServiceName}-cluster"
+          # CF를 실행하는 region의 정보를 가지고 와서, Target Region 할당
             REGION="${AWS::Region}"
           
           # 클러스터가 ACTIVE 상태가 될 때까지 최대 15분 대기 루프 --> 이거 없으니까, cluster 올라오는 시간 때문에 뒤에 개박살나요 ㅠㅜ
@@ -325,10 +361,10 @@ Resources:
               echo "Waiting for cluster... ($i/30)"
               sleep 30
             done
-
+  
             echo "Step 4: Configure Kubeconfig"
             aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME
-
+  
           # [핵심 추가] 현재 root 세션에서 kubectl이 길을 잃지 않도록 설정
             export KUBECONFIG=/root/.kube/config
           # Access Entry 권한이 실제 API 서버에 반영될 때까지 확인합니다.
@@ -409,71 +445,77 @@ Resources:
             helm upgrade --install monitoring-stack prometheus-community/kube-prometheus-stack --namespace monitoring \
               --set grafana.adminPassword='admin' \
               --wait
-
-          # 12. ArgoCD 설치 (GitOps 엔진), --server-side 옵션 안넣어주면 중간에 멈춘다...(추가는 해줬지만. 아직 검증은 안됨...)
+  
+          # 12. ArgoCD 설치 (GitOps 엔진)
+          # --server-side 옵션 안넣어주면 Log로 자원 정보를 끌어오다가, 중간에 멈춘다...(추가는 해줬지만. 아직 검증은 안됨...)
             kubectl create namespace argocd
             kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml \
               --server-side
-
+  
           # 13. ArgoCD를 외부에서 접속 가능하도록 설정 (LoadBalancer 타입)
-            # ALB Controller가 설치되어 있으므로 Ingress로 생성해도 되지만, 
-            # 실습 편의상 Service 타입을 변경하여 ALB 생성을 유도합니다.
+          # ALB Controller가 설치되어 있으므로 Ingress로 생성해도 되지만,
+          # 실습 편의상 Service 타입을 변경하여 ALB 생성을 유도합니다.
             kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "NodePort"}}'
   
-            # 12. App-of-Apps 패턴 (ArgoCD가 자신의 설정을 Git에서 가져오게 함)
-            # DE님의 Git 리포지토리가 준비되었다면 아래 주석을 해제하여 자동 연결 가능합니다.
-            # kubectl apply -f - <<EOF
-            # apiVersion: argoproj.io/v1alpha1
-            # kind: Application
-            # metadata:
-            #   name: root-application
-            #   namespace: argocd
-            # spec:
-            #   project: default
-            #   source:
-            #     repoURL: 'https://github.com/YOUR_GIT_ID/de-camping-msa-gitops.git'
-            #     targetRevision: HEAD
-            #     path: root
-            #   destination:
-            #     server: 'https://kubernetes.default.svc'
-            #     namespace: argocd
-            # EOF
+          # 12. App-of-Apps 패턴 (ArgoCD가 자신의 설정을 Git에서 가져오게 함)
+          # DE님의 Git 리포지토리가 준비되었다면 아래 주석을 해제하여 자동 연결 가능합니다.
+          # kubectl apply -f - <<EOF
+          # apiVersion: argoproj.io/v1alpha1
+          # kind: Application
+          # metadata:
+          #   name: root-application
+          #   namespace: argocd
+          # spec:
+          #   project: default
+          #   source:
+          #     repoURL: 'https://github.com/YOUR_GIT_ID/de-camping-msa-gitops.git'
+          #     targetRevision: HEAD
+          #     path: root
+          #   destination:
+          #     server: 'https://kubernetes.default.svc'
+          #     namespace: argocd
+          # EOF
           # 14. Karpenter NodePool 배포 (실제 노드 확장을 위한 설정)
           # v0.32 버전부터 Provisioner 대신 NodePool을 사용합니다.
+          # 리눅스 or k8s 명령어에서 -f 옵션 뒤 - 표기는, 표준 입력에서 데이터를 읽어온다는 의미로,
+          # 이후 구문을 파일처럼 읽어와서 처리한다는 의미.
             cat <<EOF | kubectl apply -f -
-            apiVersion: karpenter.sh/v1beta1
-            kind: NodePool
-            metadata:
-              name: default
-            spec:
-              template:
-                spec:
-                  nodeClassRef:
-                    name: default
-                  requirements:
-                    - key: "karpenter.sh/capacity-type"
-                      operator: In
-                      values: ["spot"] # 비용 절감을 위해 Spot 인스턴스 사용
-                    - key: "kubernetes.io/arch"
-                      operator: In
-                      values: ["amd64"]
-              limits:
-                cpu: 100
-            ---
-            apiVersion: karpenter.alpha.sh/v1beta1
-            kind: EC2NodeClass
-            metadata:
-              name: default
-            spec:
-              amiFamily: AL2023
-              role: "${ServiceName}-eks-node-role" # 노드 롤 이름 확인 필요
-              subnetSelectorTerms:
-                - tags:
-                    karpenter.sh/discovery: "$CLUSTER_NAME"
-              securityGroupSelectorTerms:
-                - tags:
-                    karpenter.sh/discovery: "$CLUSTER_NAME"
-            EOF
+          apiVersion: karpenter.sh/v1beta1
+          kind: NodePool
+          metadata:
+            name: default
+          spec:
+            template:
+              spec:
+                nodeClassRef:
+                  group: karpenter.k8s.aws
+                  kind: EC2NodeClass
+                  name: default
+                requirements:
+                  - key: "karpenter.sh/capacity-type"
+                    operator: In
+                    values: ["spot"]
+                  - key: "kubernetes.io/arch"
+                    operator: In
+                    values: ["amd64"]
+            limits:
+              cpu: 100
+          ---
+          apiVersion: karpenter.k8s.aws/v1beta1
+          kind: EC2NodeClass
+          metadata:
+            name: default
+          spec:
+            amiFamily: AL2023
+            # CFN Parameter를 직접 사용하므로 !를 제거합니다.
+            role: "${ServiceName}-eks-node-role"
+            subnetSelectorTerms:
+              - tags:
+                  karpenter.sh/discovery: "${!CLUSTER_NAME}"
+            securityGroupSelectorTerms:
+              - tags:
+                  karpenter.sh/discovery: "${!CLUSTER_NAME}"
+          EOF
   # ==========================================
   # 6. Public EC2 Instances
   ## 해당 부분 ingress 설정으로 test 코드 삭제함
@@ -592,6 +634,13 @@ Resources:
       InstanceProfileName: !Sub "${ServiceName}-karpenter-node-profile"
       Roles: [ !Ref EksNodeRole ]
 
+  # Karpenter 노드가 클러스터에 조인할 수 있도록 허용
+  EksNodeAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt EksNodeRole.Arn
+      Type: EC2_LINUX # EC2 노드임을 명시
 # ==========================================
 # 9. Outputs (생성된 IAM 정보 등 결과값 출력)
 # ==========================================
