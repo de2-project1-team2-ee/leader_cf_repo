@@ -17,12 +17,48 @@ set -x
 # ==============================================================================
 # 2. 클러스터 공통 설정 (빠른 작업, Foreground 실행)
 # ==============================================================================
+# 2-1) VPC CNI Prefix Delegation 설정
 kubectl set env daemonset aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true WARM_PREFIX_TARGET=1
+# 2-2) OIDC 공급자 연동
 eksctl utils associate-iam-oidc-provider --cluster $C --region $R --approve
 
+# 2-3) 네임스페이스 생성
 for ns in dev stg prod monitoring kubecost argocd; do 
   kubectl create namespace $ns --dry-run=client -o yaml | kubectl apply -f - 
 done
+
+# 2-4) EBS CSI 컨트롤러 권한 부여 및 재시작 대기
+eksctl create iamserviceaccount \
+  --name ebs-csi-controller-sa \
+  --namespace kube-system \
+  --cluster $C \
+  --region $R \
+  --attach-policy-arn "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" \
+  --approve \
+  --role-name "${SERVICE_NAME}-ebs-csi-role" \
+  --override-existing-serviceaccounts
+
+# 새로운 권한을 물고 파드가 다시 뜰 수 있도록 재시작
+kubectl rollout restart deployment ebs-csi-controller -n kube-system
+
+# [안정화 코드] 컨트롤러가 정상적으로 뜰 때까지 스크립트 진행을 멈추고 대기 (최대 2분)
+kubectl wait --for=condition=available deployment/ebs-csi-controller -n kube-system --timeout=120s
+
+# 2-5) [신규 추가] 기본 StorageClass를 최신 고성능 gp3로 설정
+echo ">> Configuring Default StorageClass (gp3)..."
+kubectl patch storageclass gp2 -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}' 2>/dev/null || true
+cat <<EOF | kubectl apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+EOF
 
 # ==============================================================================
 # 3. [백그라운드] Karpenter 스택 설치
