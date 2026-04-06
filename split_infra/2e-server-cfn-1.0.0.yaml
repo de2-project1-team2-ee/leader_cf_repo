@@ -532,7 +532,7 @@ Resources:
         - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
         - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" # 노드 트러블슈팅용 SSM 접근 권한
         # 볼륨은 일단, 주석처리하고 실행한다.
-        # - "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" # <--- 추가: DB 볼륨 관리용
+        - "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" # <--- 추가: DB 볼륨 관리용
       # 커스텀 권한(Inline Policy) 직접 명시 영역
       Policies:
         - PolicyName: !Sub "${ServiceName}-node-custom-policy"
@@ -564,12 +564,12 @@ Resources:
         AuthenticationMode: API_AND_CONFIG_MAP # API 방식 활성화 (Access Entry 사용을 위해 필수)
 
    # EBS 설정은 일단, 비활성 상태로 둔다.
-#  EbsCsiDriverAddon:
-#    Type: AWS::EKS::Addon
-#    Properties:
-#      AddonName: aws-ebs-csi-driver
-#      ClusterName: !Ref EksCluster
-#      ResolveConflicts: OVERWRITE
+  EbsCsiDriverAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: aws-ebs-csi-driver
+      ClusterName: !Ref EksCluster
+      ResolveConflicts: OVERWRITE
 
   PrivateAppNodeGroup:
     Type: AWS::EKS::Nodegroup
