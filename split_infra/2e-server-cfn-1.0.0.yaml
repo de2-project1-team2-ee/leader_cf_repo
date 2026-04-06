@@ -1,0 +1,654 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Advanced MSA Infrastructure: Parameterized IP, Public EC2, DB with EBS, and EKS for Nginx/WAS Pods'
+
+
+# 입력 순서를, 좀 더 정갈하게 하기 위해서 아래와 같이 설정.
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "1. Service & Cluster - Basic info"
+        Parameters:
+          - ServiceName
+          - KeyName
+          - KubernetesVersion
+          - BastionInstanceType
+          - AppNodeInstanceType
+      - Label:
+          default: "2. Database (RDS) Setting"
+        Parameters:
+          - DBEngine
+          - DBEngineVersion
+          - DBInstanceClass
+          - DBStorageType
+          - DBAllocatedStorage
+          - DBMultiAZ
+      - Label:
+          default: "3. Network & Infra Setting (VPC & Subnets)"
+        Parameters:
+          - VpcCidrBlock
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateAppSubnet1Cidr
+          - PrivateAppSubnet2Cidr
+          - PrivateDBSubnet1Cidr
+          - PrivateDBSubnet2Cidr
+      - Label:
+          default: "4. System & Image Setting"
+        Parameters:
+          - LatestAmiId
+      - Label:
+          default: "5. Target Namespace"
+        Parameters:
+          - AppEnvironment
+    ParameterLabels:
+      ServiceName:
+        default: "ServiceName"
+      KeyName:
+        default: "EC2 Key Pair (KeyName)"
+      KubernetesVersion:
+        default: "EKS K8S Version"
+      DBEngine:
+        default: "DB Engine"
+      DBEngineVersion:
+        default: "DB Engine Version"
+      DBInstanceClass:
+        default: "RDS (DB Instance Spec)"
+      DBStorageType:
+        default: "RDS (StorageType)"
+      DBAllocatedStorage:
+        default: "RDS init Size (GB)"
+      DBMultiAZ:
+        default: "RDS Multiple AZ Setting"
+      VpcCidrBlock:
+        default: "VPC CIDR Range"
+      PublicSubnet1Cidr:
+        default: "Public Subnet 1 CIDR"
+      PublicSubnet2Cidr:
+        default: "Public Subnet 2 CIDR"
+      PrivateAppSubnet1Cidr:
+        default: "Private App Subnet 1 CIDR (Nodes)"
+      PrivateAppSubnet2Cidr:
+        default: "Private App Subnet 2 CIDR (Nodes)"
+
+Parameters:
+  # [추가됨] 앱 배포용 네임스페이스 환경 설정
+  AppEnvironment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: [ 'dev', 'stg', 'prod' ]
+    Description: 'Target namespace for the application deployment (e.g., dev, stg, prod)'
+
+  ServiceName:
+    Type: String
+    Default: 'de-camping-msa'
+    Description: 'Service name prefix for resource tagging'
+
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: 'Select an existing EC2 KeyPair for SSH access'
+
+  BastionInstanceType:
+    Type: String
+    Default: 't3.small'
+    AllowedValues: [ 't3.small', 't3.medium' ]
+    Description: 'Select EC2 instance type for the Bastion Server'
+
+  AppNodeInstanceType:
+    Type: String
+    Default: 't3.medium'
+    AllowedValues: [ 't3.small', 't3.medium', 't3.large', 'm5.large', 'c5.large' ]
+    Description: 'Select EC2 instance type for EKS App Nodes (Managed & Karpenter)'
+
+  # [신규] DB 엔진 선택
+  DBEngine:
+    Type: String
+    Default: 'postgres'
+    AllowedValues: [ 'mysql', 'postgres', 'mariadb' ]
+    Description: 'Database engine type'
+
+  # [신규] DB 엔진 버전 선택
+  DBEngineVersion:
+    Type: String
+    Default: '17'
+    Description: 'Database engine version'
+
+  # [신규 추가] RDS 인스턴스 타입 선택
+  DBInstanceClass:
+    Type: String
+    Default: 'db.t3.micro'
+    AllowedValues: [ 'db.t3.micro', 'db.t3.medium', 'db.m5.large', 'db.r5.large' ]
+    Description: 'Select EC2 instance type for the RDS Database'
+
+  # [수정됨] 이름 변경: RDSStorageType -> DBStorageType
+  DBStorageType:
+    Type: String
+    Default: 'gp3'
+    AllowedValues: [ 'gp2', 'gp3', 'io1' ]
+    Description: 'Select Storage Type for the RDS Database'
+
+  # [신규 추가] RDS 스토리지 초기 할당 용량
+  DBAllocatedStorage:
+    Type: Number
+    Default: 50
+    MinValue: 20
+    MaxValue: 1000
+    Description: 'Allocated storage size for the RDS database (in GB)'
+
+  DBMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: [ 'true', 'false' ]
+    Description: 'Enable Multi-AZ deployment for high availability (Failover)'
+  # --- IP 대역 파라미터 ---
+  ## 대역 설정시, 중복 방지를 위해서. 마스킹 된 앞에서부터 20비트대부터 주소를 할당해야 합니다.
+  ## 예를 들어 10.0.0.0/20을 바탕으로 한 default 대역을 할당하셨다면,
+  ## 다음 대역은 10.0.0001 0000~1111 1111.* /20 으로 대역을 할당할 수 있습니다.
+  ### 추가로 현재 테스트 중인, 공유 계정에서는 region별 최대 nat를 2개까지만 할당 가능하니, 이점 확인하시어
+  ### 기존에 같은 CF로 할당된 vpc가 2개가 이미 있다면, 3번째 생성부터는 fail이 발생할 수 있습니다.
+  ### 확인해서 작업해주세요.
+  VpcCidrBlock: { Type: String, Default: '10.0.0.0/20' }
+  PublicSubnet1Cidr: { Type: String, Default: '10.0.0.0/24' }
+  PublicSubnet2Cidr: { Type: String, Default: '10.0.1.0/24' }
+  PrivateDBSubnet1Cidr: { Type: String, Default: '10.0.2.0/24' }
+  PrivateDBSubnet2Cidr: { Type: String, Default: '10.0.3.0/24' }
+  PrivateAppSubnet1Cidr: { Type: String, Default: '10.0.4.0/22' }
+  PrivateAppSubnet2Cidr: { Type: String, Default: '10.0.8.0/22' }
+
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64'
+
+  KubernetesVersion:
+    Type: String
+    # 최신버전은 1.35인데, 1계단만 다운함.
+    Default: '1.34'
+
+Resources:
+  # ==========================================
+  # 1. VPC & IGW
+  # ==========================================
+  MainVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties: { Tags: [{ Key: Name, Value: !Sub "${ServiceName}-igw" }] }
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref MainVPC, InternetGatewayId: !Ref InternetGateway }
+
+  # ==========================================
+  # 2. Subnets (2중화)
+  # ==========================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ServiceName}-public-1" }
+        - { Key: "kubernetes.io/role/elb", Value: "1" }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${ServiceName}-public-2" }
+        - { Key: "kubernetes.io/role/elb", Value: "1" }
+
+  PrivateAppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateAppSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags:
+        - { Key: Name, Value: !Sub "${ServiceName}-private-app-1" }
+        - { Key: "kubernetes.io/role/internal-elb", Value: "1" }
+        - { Key: "karpenter.sh/discovery", Value: !Sub "${ServiceName}-cluster" }
+
+  PrivateAppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateAppSubnet2Cidr
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags:
+        - { Key: Name, Value: !Sub "${ServiceName}-private-app-2" }
+        - { Key: "kubernetes.io/role/internal-elb", Value: "1" }
+        - { Key: "karpenter.sh/discovery", Value: !Sub "${ServiceName}-cluster" }
+
+  PrivateDBSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateDBSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-1" }]
+
+  PrivateDBSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateDBSubnet2Cidr
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-2" }]
+
+  # ==========================================
+  # 0. Secrets Manager (RDS 계정 정보 자동 생성)
+  # ==========================================
+  RDSSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ServiceName}-rds-secret"
+      Description: "Automatically generated RDS database credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"dbadmin"}' # 기본 마스터 계정명
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: "\"@/\\" # DB 접속 시 오류를 유발할 수 있는 특수문자 제외
+
+  # ==========================================
+  # 3. NAT & Routing
+  # ==========================================
+  NatEIP1: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
+  NatEIP2: { Type: AWS::EC2::EIP, Properties: { Domain: vpc } }
+
+  NatGW1:
+    Type: AWS::EC2::NatGateway
+    DependsOn: AttachGateway # IGW가 VPC에 완전히 붙은 후 생성되도록 강제
+    Properties:
+      AllocationId: !GetAtt NatEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-nat-1" } ]
+
+  NatGW2:
+    Type: AWS::EC2::NatGateway
+    DependsOn: AttachGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-nat-2" } ]
+
+  # --- Private App Routing (AZ 1) ---
+  PrivateAppRT1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-private-app-rt-1" } ]
+
+
+  # --- Private App Routing (AZ 2) ---
+  PrivateAppRT2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags: [ { Key: Name, Value: !Sub "${ServiceName}-private-app-rt-2" } ]
+
+
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref MainVPC, Tags: [{ Key: Name, Value: !Sub "${ServiceName}-public-rt" }] }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties: { RouteTableId: !Ref PublicRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref InternetGateway }
+
+  PrivateRouteApp1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRT1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW1
+  PrivateRouteApp2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateAppRT2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGW2
+
+  # Route Table Associations
+  RTAssocPub1: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRT } }
+  RTAssocPub2: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRT } }
+
+  RTAssocPrivApp1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet1
+      RouteTableId: !Ref PrivateAppRT1
+  RTAssocPrivApp2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateAppSubnet2
+      RouteTableId: !Ref PrivateAppRT2
+
+  # [문법 교정 부분] DB Subnets are completely isolated (No Internet/NAT route)
+  # DB 전용 격리 라우팅 테이블 명시적 생성 및 연결
+  PrivateDBRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-private-db-rt" }]
+
+  RTAssocPrivDB1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnet1
+      RouteTableId: !Ref PrivateDBRT
+
+  RTAssocPrivDB2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateDBSubnet2
+      RouteTableId: !Ref PrivateDBRT
+  # ==========================================
+  # 4. Security Groups
+  # ==========================================
+  # 이하, BastionSG는 ssh 터미널 사용에 따른 임시코드 입니다.
+  # 추후, 구축 완료시. 해당 코드를 삭제하고 아래 BastionSG 코드를 활성화 하세요.
+  BastionSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress: [{ IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: 0.0.0.0/0 }]
+  # 아래는 공인 IP 할당을 통한 SSH 제한 설정
+  #      SecurityGroupIngress:
+  #        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: "내.공인.IP.주소/32" }
+
+  # 추후 활성화 해야하는
+  #  BastionSG:
+  #    Type: AWS::EC2::SecurityGroup
+  #    Properties:
+  #      GroupDescription: Allow strictly no inbound ports (SSM Only Access)
+  #      VpcId: !Ref MainVPC
+  #      # SecurityGroupIngress: 아무것도 설정하지 않음 (전면 차단)
+
+  ## public Subnet, 보안 그룹 설정
+  # 해당 영역, Karpenter를 이용한 Ingress 설정 및 LoadBalancer 설정
+  ## 검색어 --> AWS Load Balancer Controller 설치 (Ingress 지원용)
+  PublicAppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public App SG (ALB)
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, SourceSecurityGroupId: !GetAtt BastionSG.GroupId }
+      Tags:
+        - { Key: Name, Value: !Sub "${ServiceName}-alb-sg" }
+
+  ## Eks Node Group(현재 설정상 Private App 영역, 보안그룹 설정)
+  EksNodeSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for EKS App Nodes
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 65535,  CidrIp: !Ref VpcCidrBlock } # VPC 내부 라우팅 전체 허용
+        - { IpProtocol: tcp, FromPort: 9443, ToPort: 9443, CidrIp: !Ref VpcCidrBlock }
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref PublicAppSG }
+      Tags: # <--- SecurityGroupIngress 밖으로 빼서 별도 정의해야 합니다.
+        - { Key: "karpenter.sh/discovery", Value: !Sub "${ServiceName}-cluster" }
+        - { Key: Name, Value: !Sub "${ServiceName}-eks-node-sg" }
+
+  DBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SG for DB EC2
+      VpcId: !Ref MainVPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !GetAtt EksNodeSG.GroupId } # WAS Pods -> DB
+
+  # ==========================================
+  # 5. Bastion (AWS 공식 CLI 도구 탑재 및 인증 자동화)
+  # ==========================================
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ServiceName}-bastion-role" # 역할 이름 명시적 지정
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [ { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole } ]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" # SSH 키 없이 웹 터미널 접속(SSM) 권한 추가
+
+  BastionProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [ !Ref BastionRole ] }
+
+  # EKS Access Entry 추가 (Bastion에게 클러스터 관리 권한 자동 부여)
+  BastionAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt BastionRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+      ###      주요 Access Policy들은 다음과 같습니다. 필요에 따라 권한을 조정하실 때 참고하세요.
+      #      ClusterAdmin: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy (모든 권한)
+      #      Admin: arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy (대부분의 관리 권한)
+      #      Edit: arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy (수정 권한)
+      #      View: arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy (읽기 권한)
+        # 'iam'이 아니라 'eks'이며, 'cluster-access-policy' 경로를 사용해야 합니다.
+        # - PolicyArn: arn:aws:iam::aws:policy/AmazonEKSClusterAdminPolicy
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  BastionServer:
+    Type: AWS::EC2::Instance
+    DependsOn: PrivateAppNodeGroup # BastionServer, PrivateAppNodeGroup 동시 설치 시. PrivateAppNodeGroup 생성 속도로 인해 TimeOut 발생
+    Properties:
+      InstanceType: !Ref BastionInstanceType # <--- 하드코딩(t3.small)에서 교체
+      # t3.nano 로 했다가, eksctl 안되는 문제 생김;
+      ImageId: !Ref LatestAmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds: [!Ref BastionSG]
+      IamInstanceProfile: !Ref BastionProfile
+      Tags: [{ Key: Name, Value: !Sub "${ServiceName}-bastion" }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -ex
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          
+          # 1. Essential Tools & OS Update
+          dnf update -y && dnf install -y unzip wget tar python3
+          
+          # 2. Download Official CLI Tools
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip && ./aws/install && rm -rf awscliv2.zip aws
+          
+          curl -sLO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl" && chmod +x kubectl && mv kubectl /usr/local/bin/
+          
+          V=$(curl -sL https://api.github.com/repos/argoproj/argo-cd/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/download/$V/argocd-linux-amd64 && chmod +x /usr/local/bin/argocd
+          
+          curl -sL "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /usr/local/bin
+          curl -sL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          
+          # 3. Wait for EKS Cluster & Setup Kubeconfig
+          C="${ServiceName}-cluster"
+          R="${AWS::Region}"
+          
+          until [ "$(aws eks describe-cluster --name $C --region $R --query 'cluster.status' --output text 2>/dev/null)" == "ACTIVE" ]; do sleep 15; done
+          aws eks update-kubeconfig --region $R --name $C
+          export KUBECONFIG=/root/.kube/config
+          
+          until kubectl get nodes &>/dev/null; do sleep 10; done
+          
+          # 4. Copy Kubeconfig to ec2-user
+          mkdir -p /home/ec2-user/.kube && cp /root/.kube/config /home/ec2-user/.kube/config && chown -R ec2-user:ec2-user /home/ec2-user/.kube
+          echo "export KUBECONFIG=/home/ec2-user/.kube/config" >> /home/ec2-user/.bashrc
+          
+          # 5. [추가] 쉘 스크립트용 환경 변수 자동 생성
+          cat <<EOF > /home/ec2-user/.deploy_env
+          export SERVICE_NAME="${ServiceName}"
+          export R="${AWS::Region}"
+          export C="${ServiceName}-cluster"
+          export APP_NODE_INSTANCE_TYPE="${AppNodeInstanceType}"
+          export EKS_NODE_ROLE="${ServiceName}-eks-node-role"
+          export MAIN_VPC="${MainVPC}"
+          export APP_ENVIRONMENT="${AppEnvironment}"
+          EOF
+          chown ec2-user:ec2-user /home/ec2-user/.deploy_env
+          
+          echo "CFN Bastion UserData Setup Completed successfully."
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ServiceName}-eks-cluster-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [ { Effect: Allow, Principal: { Service: eks.amazonaws.com }, Action: sts:AssumeRole } ]
+      ManagedPolicyArns: [ "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy" ]
+
+  EksNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ServiceName}-eks-node-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [ { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole } ]
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+        - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore" # 노드 트러블슈팅용 SSM 접근 권한
+        # 볼륨은 일단, 주석처리하고 실행한다.
+        # - "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy" # <--- 추가: DB 볼륨 관리용
+      # 커스텀 권한(Inline Policy) 직접 명시 영역
+      Policies:
+        - PolicyName: !Sub "${ServiceName}-node-custom-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource: "*" # 필요 시 특정 S3 버킷이나, ALB Controller 권한 등으로 교체/확장 가능
+        - PolicyName: !Sub "${ServiceName}-secrets-policy" # EksNodeRole의 Policies 섹션에 추가
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: "secretsmanager:GetSecretValue"
+                Resource: !Ref RDSSecret
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub "${ServiceName}-cluster"
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
+        SecurityGroupIds: [ !GetAtt EksNodeSG.GroupId ]
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP # API 방식 활성화 (Access Entry 사용을 위해 필수)
+
+   # EBS 설정은 일단, 비활성 상태로 둔다.
+#  EbsCsiDriverAddon:
+#    Type: AWS::EKS::Addon
+#    Properties:
+#      AddonName: aws-ebs-csi-driver
+#      ClusterName: !Ref EksCluster
+#      ResolveConflicts: OVERWRITE
+
+  PrivateAppNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EksCluster
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodegroupName: !Sub "${ServiceName}-private-app-nodes"
+      NodeRole: !GetAtt EksNodeRole.Arn
+      Subnets: [ !Ref PrivateAppSubnet1, !Ref PrivateAppSubnet2 ]
+      InstanceTypes: [ !Ref AppNodeInstanceType ]
+      ScalingConfig: { MinSize: 2, DesiredSize: 2, MaxSize: 4 }
+      Tags:
+        Name: !Sub "${ServiceName}-app-node" # 이 태그가 EC2의 'Name' 필드로 표시됩니다.
+        Project: !Ref ServiceName
+
+  ## Karpenter로 생성된 EC2 instance가,cluster 아래에서 관리되게 하기 위한 설정.
+  # IAM Role
+  KarpenterNodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ServiceName}-karpenter-node-profile"
+      Roles: [ !Ref EksNodeRole ]
+
+  # Karpenter 노드가 클러스터에 조인할 수 있도록 허용
+  EksNodeAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt EksNodeRole.Arn
+      Type: EC2_LINUX # EC2 노드임을 명시
+# ==========================================
+  # 7. RDS Database (기존 EC2 DB 대체)
+  # ==========================================
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for Private RDS"
+      SubnetIds:
+        - !Ref PrivateDBSubnet1
+        - !Ref PrivateDBSubnet2
+      Tags:
+        - { Key: Name, Value: !Sub "${ServiceName}-rds-subnet-group" }
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${ServiceName}-rds"
+      Engine: !Ref DBEngine
+      EngineVersion: !Ref DBEngineVersion
+      
+      # 파라미터 연동 영역 (하드코딩 제거)
+      DBInstanceClass: !Ref DBInstanceClass    # 인스턴스 사양 선택
+      StorageType: !Ref DBStorageType          # 디스크 타입 선택
+      AllocatedStorage: !Ref DBAllocatedStorage # 초기 용량 입력
+      
+      MasterUsername: !Join ["", ["{{resolve:secretsmanager:", !Ref RDSSecret, ":SecretString:username}}"]]
+      MasterUserPassword: !Join ["", ["{{resolve:secretsmanager:", !Ref RDSSecret, ":SecretString:password}}"]]
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups: [!GetAtt DBSG.GroupId]
+      MultiAZ: !Ref DBMultiAZ               
+      PubliclyAccessible: false    
+      # SkipFinalSnapshot: true
+
+# ==========================================
+# 9. Outputs (생성된 IAM 정보 등 결과값 출력)
+# ==========================================
+Outputs:
+  BastionRoleArn:
+    Description: "IAM Role ARN for Bastion Server"
+    Value: !GetAtt BastionRole.Arn
+    Export:
+      Name: !Sub "${ServiceName}-BastionRoleArn"
+
+  EksNodeRoleArn:
+    Description: "IAM Role ARN for EKS App Nodes"
+    Value: !GetAtt EksNodeRole.Arn
+    Export:
+      Name: !Sub "${ServiceName}-EksNodeRoleArn"
+
+  EksClusterRoleArn:
+    Description: "IAM Role ARN for EKS Cluster Control Plane"
+    Value: !GetAtt EksClusterRole.Arn
