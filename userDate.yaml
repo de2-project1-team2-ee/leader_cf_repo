@@ -1,0 +1,439 @@
+Fn::Base64: !Sub |
+          #!/bin/bash
+          ## 1. Bastion 서버 내부, 명령어 수행을 위한 준비
+            set -ex # 에러 발생 시 즉시 중단 및 로그 출력
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+  
+            echo "Step 1: Basic Tools"
+            dnf update -y && dnf install -y unzip wget tar
+  
+            echo "Step 2: Install CLI Tools"
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip && ./aws/install
+          
+                      
+          ## 2-1. kubesctl 설치
+            curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/
+          
+          ## 2-2. argo_cd cli 설치
+            echo "Step 2.1: Install ArgoCD CLI"
+            VERSION=$(curl -L -s https://api.github.com/repos/argoproj/argo-cd/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+            curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/download/$VERSION/argocd-linux-amd64
+            install -m 755 argocd-linux-amd64 /usr/local/bin/argocd
+            rm argocd-linux-amd64
+          
+          ## 2-3. eksctl 설치
+          # eksctl (보다 견고한 설치 방식)
+            curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
+            mv /tmp/eksctl /usr/local/bin/
+          
+          ## 2-4. helm 설치
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+  
+          ## 3. EKS 접속 및 대기 (클러스터가 생성될 때까지 대기)
+          # ServiceName properties를 이용한 ClusterName 생성
+            echo "Step 3: Wait for EKS Cluster to be ACTIVE"
+            CLUSTER_NAME="${ServiceName}-cluster"
+          # CF를 실행하는 region의 정보를 가지고 와서, Target Region 할당
+            REGION="${AWS::Region}"
+          
+          # 클러스터가 ACTIVE 상태가 될 때까지 최대 15분 대기 루프 --> 이거 없으니까, cluster 올라오는 시간 때문에 뒤에 개박살나요 ㅠㅜ
+            for i in {1..30}; do
+              STATUS=$(aws eks describe-cluster --name $CLUSTER_NAME --region $REGION --query 'cluster.status' --output text 2>/dev/null || echo "WAITING")
+              if [ "$STATUS" == "ACTIVE" ]; then
+                echo "Cluster is ACTIVE."
+                break
+              fi
+              echo "Waiting for cluster... ($i/30)"
+              sleep 30
+            done
+  
+            echo "Step 4: Configure Kubeconfig"
+            aws eks update-kubeconfig --region $REGION --name $CLUSTER_NAME
+  
+          # [핵심 추가] 현재 root 세션에서 kubectl이 길을 잃지 않도록 설정
+            export KUBECONFIG=/root/.kube/config
+          # Access Entry 권한이 실제 API 서버에 반영될 때까지 확인합니다.
+            echo "Waiting for K8s API authorization..."
+            for i in {1..20}; do
+              if kubectl get nodes &>/dev/null; then
+                echo "K8s API is reachable and authorized!"
+                break
+              fi
+              echo "Waiting for authorization... ($i/20)"
+              sleep 15
+            done
+          # --> 위 구문 없으면, eks cluster 생성만 되고 실행 확인 안된 상태로 넘어가서. 아래 구문들에서 에러납니다.
+          
+          # ---------------------------------------------------------
+          # [신규 추가] AWS VPC CNI - Prefix Delegation 활성화 (Pod 동적 할당 극대화)
+          # 서버 선택 시, 서버(instance) 타입마다 ENI와 IP가 정해져있어. 대역폭의 낭비가 발생 가능함
+          # 아래는 그 부분에 대한, 대역폭 낭비를 막아주고 (IP 블럭 조정 등)
+          # 그만큼 node에 대한 할당을 유연하게 가져 가도록 설정한다.
+          # ---------------------------------------------------------
+            echo "Enable VPC CNI Prefix Delegation..."
+            # 1. Prefix 위임 기능 활성화 (t3.medium 기준 Pod 한도를 17개 -> 110개 폭증시킴)
+            kubectl set env daemonset aws-node -n kube-system ENABLE_PREFIX_DELEGATION=true
+          
+            # 2. 너무 많은 여유 IP를 잡아먹지 않도록 웜풀(Warm Pool) 최적화
+            kubectl set env daemonset aws-node -n kube-system WARM_PREFIX_TARGET=1
+          # ---------------------------------------------------------
+          
+          ## 4. OIDC Provider 연결 (IRSA의 핵심), region 정보 추가.
+            eksctl utils associate-iam-oidc-provider --cluster $CLUSTER_NAME \
+            --region $REGION --approve
+          
+          ## 5. Karpenter 컨트롤러용 IAM Role 생성 및 IRSA 연결 (자동화)
+            eksctl create iamserviceaccount \
+            --cluster $CLUSTER_NAME \
+            --region $REGION \
+            --name karpenter \
+            --namespace karpenter \
+            --role-name "${ServiceName}-karpenter-controller-role" \
+            --attach-policy-arn "arn:aws:iam::aws:policy/AdministratorAccess" \
+            --approve --override-existing-serviceaccounts
+          
+          ## 6. Namespace 생성
+          # [사용자 편의] ec2-user에게도 설정 복사 및 소유권 변경
+            mkdir -p /home/ec2-user/.kube
+            cp /root/.kube/config /home/ec2-user/.kube/config
+            chown -R ec2-user:ec2-user /home/ec2-user/.kube
+            echo "export KUBECONFIG=/home/ec2-user/.kube/config" >> /home/ec2-user/.bashrc
+          
+          # --> 위 구문, 없으면 얘가 kubectl 실행 못해서. 쉘 끊깁니다.
+          
+            for ns in dev stg prod monitoring; do
+              kubectl create namespace $ns --dry-run=client -o yaml | kubectl apply -f -
+            done
+          
+          # 7. Karpenter 설치 (Helm) - 엔드포인트 및 인터럽트 큐 최적화
+          # ${EksCluster}는 aws를 통해 만들어진 자원의 명칭으로 정보를 할당한다.
+            CLUSTER_ENDPOINT=$(aws eks describe-cluster --name "${EksCluster}" --query 'cluster.endpoint' --output text)
+          
+            helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+              --version 1.2.0 \
+              --namespace karpenter \
+              --set serviceAccount.create=false \
+              --set serviceAccount.name=karpenter \
+              --set settings.clusterName="${EksCluster}" \
+              --set settings.clusterEndpoint=$CLUSTER_ENDPOINT \
+              --wait
+          
+          # 8. AWS Load Balancer Controller 설치 (Ingress 지원용)
+          # IRSA용 IAM Role 생성 (eksctl 활용)
+          # ALB Controller 권한 변경,  --attach-policy-arn "arn:aws:iam::aws:policy/AmazonEKS_FullAccess" \
+            eksctl create iamserviceaccount \
+              --cluster "${EksCluster}" \
+              --region "${AWS::Region}" \
+              --namespace kube-system \
+              --name aws-load-balancer-controller \
+              --role-name "${ServiceName}-alb-controller-role" \
+              --attach-policy-arn "arn:aws:iam::aws:policy/AdministratorAccess" \
+              --approve --override-existing-serviceaccounts
+          
+          # eks, alb controller 설치
+            helm repo add eks https://aws.github.io/eks-charts
+            helm repo update
+            helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+              -n kube-system \
+              --set clusterName=${EksCluster} \
+              --set serviceAccount.create=false \
+              --set serviceAccount.name=aws-load-balancer-controller \
+              --set vpcId=${MainVPC} \
+              --set region=${AWS::Region} \
+              --wait
+          
+          # 9. 모니터링 도구 설치 (Prometheus & Grafana)
+            helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+            helm repo update
+          ## 아래 옵션은 확인용으로 잠깐 줬습니다. 어차피 IP Cluster를 통해서 grafana로 연결되어 보여지기 때문에 별도의 설정은 하지 않습니다.
+          #              --set prometheus.service.type=LoadBalancer \
+          #              --set alertmanager.service.type=LoadBalancer \
+            helm upgrade --install monitoring-stack prometheus-community/kube-prometheus-stack --namespace monitoring \
+              --set grafana.adminPassword='admin' \
+              --set grafana.service.type=LoadBalancer \
+              --wait
+  
+          # 10. ArgoCD 설치 (GitOps 엔진)
+          # --server-side 옵션 안넣어주면 Log로 자원 정보를 끌어오다가, 중간에 멈춘다...(추가는 해줬지만. 아직 검증은 안됨...)
+            kubectl create namespace argocd
+            kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml \
+              --server-side
+              
+          # [비밀번호 초기화 로직 추가]
+            echo "Waiting for ArgoCD Server to be ready..."
+            kubectl wait --for=condition=available deployment/argocd-server -n argocd --timeout=300s
+          
+          # ArgoCD CLI를 위한 환경 변수 강제 설정 --> 해당 설정이 없을 경우, INITIAL_PW의 초기화 구문에서 $Home 경로를 찾지 못함.
+            export HOME=/root
+            export KUBECONFIG=/root/.kube/config
+          
+            NEW_PW="admin123" 
+          
+          # argocd login 없이 직접 비밀번호 해시 주입
+          ## argocd CLI를 사용하여 bcrypt 해시 생성, 뒤에 있는 tr -d '\n'이 없으면 argo_cd에서 해석 오류남...
+          ### 아래 코드를 적용해도, hash-pasword 함수를 찾을 수 없어서 에러 남. 
+          # HASHED_PW=$(argocd admin hash-password "${!NEW_PW}" | tr -d '\n')
+          #### CLI 버전 이슈 해결을 위해 AL2023 내장 Python3로 bcrypt 해시 직접 생성
+          # crypt.METHOD_BLOWFISH는 ArgoCD가 요구하는 $2b$ (bcrypt) 해시를 생성합니다.
+            HASHED_PW=$(python3 -c "import crypt; print(crypt.crypt('${!NEW_PW}', crypt.mksalt(crypt.METHOD_BLOWFISH)))")
+          
+          # argocd-secret 직접 패치 (비밀번호 및 변경 시간 업데이트)
+            kubectl patch secret argocd-secret -n argocd -p "{\"stringData\": {\"admin.password\": \"${!HASHED_PW}\", \"admin.passwordMtime\": \"$(date +%FT%T%Z)\"}}"
+
+          # 초기 비밀번호 시크릿 삭제 (보안 및 패치 활성화)
+            kubectl -n argocd delete secret argocd-initial-admin-secret
+          
+          ### 이하, argo_cd --core를 통한 grpc를 통한 초기화 시도 과정. 결국은, 
+          #          # 초기 비밀번호 획득
+          #            INITIAL_PW=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+          #            NEW_PW="admin123"  # <-- 원하는 비밀번호로 수정하세요.
+          #          
+          #          # argocd CLI가 default가 아닌 argocd 네임스페이스를 바라보도록 컨텍스트 강제 변경
+          #          # --> 해당 구문이 없으면, default ns가 argocd-cm으로 지정되어. login할 때, 
+          #            kubectl config set-context --current --namespace=argocd
+          #          
+          #          # ArgoCD CLI의 'Core' 모드를 사용하여 API 서버 통신 없이 로컬에서 즉시 변경
+          #            argocd admin initial-password -n argocd  # 초기화 확인용
+          #            argocd login --core # API 서버 접속 없이 쿠버네티스 권한으로 로그인
+          #            argocd account update-password --current-password "${!INITIAL_PW}" --new-password "${!NEW_PW}"
+          #
+          #          # 보안을 위해 초기 비밀번호 시크릿 삭제
+          #            kubectl -n argocd delete secret argocd-initial-admin-secret
+          #          
+          #          # (선택) 작업 완료 후 다른 작업에 영향을 주지 않도록 default 네임스페이스로 원복
+          #          # --> 위에서 config ns를 바꿔주는 작업이 있었기 때문에, 아래에서 원복합니다.
+          #            kubectl config set-context --current --namespace=default
+  
+          # 11. ArgoCD를 외부에서 접속 가능하도록 설정 (LoadBalancer 타입)
+          # ALB Controller가 설치되어 있으므로 Ingress로 생성해도 되지만,
+          # 실습 편의상 Service 타입을 변경하여 ALB 생성을 유도합니다.
+            kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}'
+  
+          
+          # 12. App-of-Apps 패턴 (ArgoCD가 자신의 설정을 Git에서 가져오게 함)
+          # DE님의 Git 리포지토리가 준비되었다면 아래 주석을 해제하여 자동 연결 가능합니다.
+          # kubectl apply -f - <<EOF
+          # apiVersion: argoproj.io/v1alpha1
+          # kind: Application
+          # metadata:
+          #   name: root-application
+          #   namespace: argocd
+          # spec:
+          #   project: default
+          #   source:
+          #     repoURL: 'https://github.com/YOUR_GIT_ID/de-camping-msa-gitops.git'
+          #     targetRevision: HEAD
+          #     path: root
+          #   destination:
+          #     server: 'https://kubernetes.default.svc'
+          #     namespace: argocd
+          # EOF
+          
+          
+          # 13. Karpenter NodePool 배포 (실제 노드 확장을 위한 설정)
+          # v0.32 버전부터 Provisioner 대신 NodePool을 사용합니다.
+          # 리눅스 or k8s 명령어에서 -f 옵션 뒤 - 표기는, 표준 입력에서 데이터를 읽어온다는 의미로,
+          # 이후 구문을 파일처럼 읽어와서 처리한다는 의미.
+            cat <<EOF | kubectl apply -f -
+          apiVersion: karpenter.sh/v1
+          kind: NodePool
+          metadata:
+            name: default
+          spec:
+            template:
+              spec:
+                nodeClassRef:
+                  group: karpenter.k8s.aws
+                  kind: EC2NodeClass
+                  name: default
+                requirements:
+                  - key: "karpenter.sh/capacity-type"
+                    operator: In
+                    values: ["spot"]
+                  - key: "kubernetes.io/arch"
+                    operator: In
+                    values: ["amd64"]
+                  - key: "node.kubernetes.io/instance-type"
+                    operator: In
+                    values: ["${AppNodeInstanceType}"]
+            limits:
+              cpu: 100
+          ---
+          apiVersion: karpenter.k8s.aws/v1
+          kind: EC2NodeClass
+          metadata:
+            name: default
+          spec:
+            # 필수 추가: 어떤 AMI를 찾을지 명시 (AL2023의 경우 태그나 이름을 지정)
+            amiSelectorTerms:
+              - alias: al2023@latest
+            role: "${EksNodeRole}"
+            subnetSelectorTerms:
+              - tags:
+                  karpenter.sh/discovery: "${EksCluster}"
+            securityGroupSelectorTerms:
+              - tags:
+                  karpenter.sh/discovery: "${EksCluster}"
+          EOF
+          
+          # ---------------------------------------------------------
+          # 14. Metrics Server 설치 (HPA 작동을 위한 필수 메트릭 수집기)
+          # ---------------------------------------------------------
+            echo "Step 14: Install Metrics Server for HPA"
+            kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+          
+          # ---------------------------------------------------------
+          # 15. Ingress + HPA + Deployment 통합 배포 (샘플 WAS)
+          # ---------------------------------------------------------
+          # deployment --> cfn 외에 별도 파일로 설정.
+          # ---------------------------------------------------------
+            APP_NAME="${ServiceName}-app"
+            APP_NS="${AppEnvironment}" # CFN 파라미터에서 선택한 환경값을 받아옴
+          
+            echo "Step 15: Deploy ${!APP_NAME} to namespace [${!APP_NS}] with HPA and Ingress"
+          # 혹시 모를 상황을 대비해 네임스페이스 생성 강제 실행 (안전장치)
+            kubectl create namespace ${!APP_NS} --dry-run=client -o yaml | kubectl apply -f -
+          
+          ### 아래 라인, Deploy part가 빠지면서 주석처리 됨.
+          #   cat <<EOF | kubectl apply -f -
+          # apiVersion: apps/v1
+          # kind: Deployment
+          # metadata:
+          #   name: ${!APP_NAME}
+          #   namespace: ${!APP_NS} # 동적 네임스페이스 할당
+          # spec:
+          #   selector:
+          #     matchLabels:
+          #       app: ${!APP_NAME}
+          #   template:
+          #     metadata:
+          #       labels:
+          #         app: ${!APP_NAME}
+          #     spec:
+          #       containers:
+          #       - name: was
+          #         image: nginx:latest # 테스트용 Nginx 이미지, 추후 다른 이미지로 교체 필
+          #         resources:
+          #           requests:
+          #             cpu: 100m     # HPA 계산의 기준점 (필수)
+          #             memory: 128Mi
+          #           limits:
+          #             cpu: 250m
+          #             memory: 256Mi
+          #         ports:
+          #         - containerPort: 80
+          # ---
+          # apiVersion: v1
+          # kind: Service
+          # metadata:
+          #   name: ${!APP_NAME}-svc
+          #   namespace: ${!APP_NS} # 동적 네임스페이스 할당
+          # spec:
+          #   selector:
+          #     app: ${!APP_NAME}
+          #   ports:
+          #     - protocol: TCP
+          #       port: 80
+          #       targetPort: 80
+          #   type: ClusterIP
+          # ---
+          # apiVersion: autoscaling/v2
+          # kind: HorizontalPodAutoscaler
+          # metadata:
+          #   name: ${!APP_NAME}-hpa
+          #   namespace: ${!APP_NS} # 동적 네임스페이스 할당
+          # spec:
+          #   scaleTargetRef:
+          #     apiVersion: apps/v1
+          #     kind: Deployment
+          #     name: ${!APP_NAME}
+          #   minReplicas: 2
+          #   maxReplicas: 10
+          #   metrics:
+          #   - type: Resource
+          #     resource:
+          #       name: cpu
+          #       target:
+          #         type: Utilization
+          #         averageUtilization: 50 # CPU 사용률이 50%를 넘으면 Pod 확장
+          # ---
+          # apiVersion: networking.k8s.io/v1
+          # kind: Ingress
+          # metadata:
+          #   name: ${ServiceName}-ingress
+          #   namespace: ${!APP_NS} # 동적 네임스페이스 할당
+          #   annotations:
+          #     alb.ingress.kubernetes.io/scheme: internet-facing
+          #     alb.ingress.kubernetes.io/target-type: ip
+          #     alb.ingress.kubernetes.io/security-groups: "${PublicAppSG}" # ALB에 보안그룹 자동 할당
+          #     alb.ingress.kubernetes.io/subnets: "${PublicSubnet1}, ${PublicSubnet2}"
+          # spec:
+          #   ingressClassName: alb
+          #   rules:
+          #     - http:
+          #         paths:
+          #           - path: /
+          #             pathType: Prefix
+          #             backend:
+          #               service:
+          #                 name: ${!APP_NAME}-svc
+          #                 port:
+          #                   number: 80
+          # EOF
+          ### 위 라인까지, Deploy part가 빠지면서. 위와 같이
+
+
+          # ---------------------------------------------------------
+          # 16. Kubecost 설치 (EKS 자원 비용 모니터링 도구)
+          # ---------------------------------------------------------
+            echo "Step 16: Install Kubecost"
+            KUBECOST_NS="kubecost"
+
+            # 네임스페이스 생성 (이미 존재할 경우를 대비한 안전한 멱등성 보장 처리)
+            kubectl create namespace ${!KUBECOST_NS} --dry-run=client -o yaml | kubectl apply -f -
+            
+            # Kubecost Helm 레포지토리 추가 및 업데이트
+            helm repo add kubecost https://kubecost.github.io/cost-analyzer/
+            helm repo update
+            
+            # Kubecost 설치 (외부 접속을 위한 LoadBalancer 설정)
+            helm upgrade --install kubecost kubecost/cost-analyzer \
+              --namespace ${!KUBECOST_NS}
+              --set kubecostProductConfigs.clusterName=$CLUSTER_NAME \
+              --set service.type=LoadBalancer \
+              --wait
+              
+            # 접속 URL 추출 및 사용자 편의를 위한 로그 출력
+            KUBECOST_DNS=$(kubectl get svc kubecost-cost-analyzer -n ${!KUBECOST_NS} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Pending")
+            echo "========================================================="
+            echo "🚀 Kubecost Access URL: http://$KUBECOST_DNS:9090"
+            echo "========================================================="
+
+          # ---------------------------------------------------------
+          # 17. Kube-Ops-View 설치 (EKS 클러스터 실시간 시각화)
+          # Karpenter의 노드 확장(Scale-out)을 그래픽으로 모니터링
+          # ---------------------------------------------------------
+            echo "Step 17: Install Kube-Ops-View"
+            KUBEOPS_NS="monitoring" # 기존 모니터링 도구들과 같은 네임스페이스 사용
+            
+            # Kube-Ops-View Helm 레포지토리 추가 및 업데이트
+            helm repo add christianhuth https://charts.christianhuth.de
+            helm repo update
+            
+            # Kube-Ops-View 설치 (LoadBalancer로 노출)
+            helm upgrade --install kube-ops-view christianhuth/kube-ops-view \
+              --namespace ${!KUBEOPS_NS} \
+              --set rbac.create=true \
+              --set service.type=LoadBalancer \
+              --wait
+              
+            # 접속 URL 추출 및 출력
+            KUBEOPS_DNS=$(kubectl get svc kube-ops-view -n ${!KUBEOPS_NS} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Pending")
+            
+            echo "========================================================="
+            echo "🚀 Kube-Ops-View Access URL: http://$KUBEOPS_DNS"
+            echo "※ UI 글씨가 작을 경우 URL 끝에 /#scale=1.5 를 붙여보세요."
+            echo "========================================================="
